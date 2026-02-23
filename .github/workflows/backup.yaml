@@ -3,7 +3,7 @@ name: supabase-backup
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * 0" # Runs at 00:00, only on Sunday
+    - cron: "0 0 * * *" 
 
 env:
   BACKUP_ENABLED: true  
