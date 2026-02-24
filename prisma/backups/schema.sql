@@ -88,7 +88,7 @@ ALTER FUNCTION "public"."add_correction_type_value"("new_value" "text") OWNER TO
 
 CREATE OR REPLACE FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval DEFAULT '72:00:00'::interval, "max_delete" integer DEFAULT 300) RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'storage'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 DECLARE
   deleted_count INTEGER := 0;
@@ -123,7 +123,7 @@ ALTER FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval, "max_
 
 CREATE OR REPLACE FUNCTION "public"."delete_empty_crag"("target_crag_id" "uuid", "grace_period" interval DEFAULT '24:00:00'::interval) RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 DECLARE
   deleted_count integer := 0;
@@ -152,7 +152,7 @@ ALTER FUNCTION "public"."delete_empty_crag"("target_crag_id" "uuid", "grace_peri
 
 CREATE OR REPLACE FUNCTION "public"."delete_empty_crags"("grace_period" interval DEFAULT '24:00:00'::interval) RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 DECLARE
   deleted_count integer := 0;
@@ -231,6 +231,7 @@ ALTER FUNCTION "public"."find_region_by_location"("search_lat" double precision,
 
 CREATE OR REPLACE FUNCTION "public"."get_active_climbers_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT COUNT(DISTINCT user_id) FROM logs
   WHERE date_climbed >= NOW() - INTERVAL '60 days';
@@ -242,6 +243,7 @@ ALTER FUNCTION "public"."get_active_climbers_count"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_boulders_with_gps_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT COUNT(DISTINCT c.crag_id)
   FROM climbs c
@@ -301,6 +303,7 @@ ALTER FUNCTION "public"."get_climbs_with_consensus"("p_climb_ids" "uuid"[]) OWNE
 
 CREATE OR REPLACE FUNCTION "public"."get_community_photos_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT COUNT(*) FROM images;
 $$;
@@ -347,7 +350,7 @@ ALTER FUNCTION "public"."get_grade_vote_distribution"("climb_id" "uuid") OWNER T
 
 CREATE OR REPLACE FUNCTION "public"."get_star_rating_summary"("p_climb_id" "uuid") RETURNS TABLE("avg_rating" numeric, "rating_count" integer)
     LANGUAGE "sql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT
     ROUND(AVG(star_rating)::numeric, 2) AS avg_rating,
@@ -363,6 +366,7 @@ ALTER FUNCTION "public"."get_star_rating_summary"("p_climb_id" "uuid") OWNER TO 
 
 CREATE OR REPLACE FUNCTION "public"."get_total_climbs_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT COUNT(*) FROM climbs WHERE deleted_at IS NULL;
 $$;
@@ -373,6 +377,7 @@ ALTER FUNCTION "public"."get_total_climbs_count"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_total_logs_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT COUNT(*) FROM user_climbs;
 $$;
@@ -383,6 +388,7 @@ ALTER FUNCTION "public"."get_total_logs_count"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_total_sends_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT COUNT(*) FROM logs
   WHERE status IN ('completed', 'flash', 'onsight');
@@ -394,7 +400,7 @@ ALTER FUNCTION "public"."get_total_sends_count"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_user_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
-    SET "search_path" TO 'auth'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT COUNT(*) FROM users;
 $$;
@@ -420,6 +426,7 @@ ALTER FUNCTION "public"."get_verification_count"("climb_id" "uuid") OWNER TO "po
 
 CREATE OR REPLACE FUNCTION "public"."get_verified_routes_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
   SELECT COUNT(*) FROM climbs
   WHERE (verification_count >= 3 OR is_verified = true)
@@ -432,6 +439,7 @@ ALTER FUNCTION "public"."get_verified_routes_count"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."handle_new_user"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 BEGIN
   -- Skip if no email (Mailpit sometimes creates users without email)
@@ -461,6 +469,7 @@ ALTER FUNCTION "public"."handle_new_user"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."handle_user_metadata_update"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 DECLARE
   provider_text text;
@@ -511,7 +520,7 @@ ALTER FUNCTION "public"."handle_user_metadata_update"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."images_recompute_crag_location_trigger"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
@@ -563,7 +572,7 @@ ALTER FUNCTION "public"."increment_crag_report_count"("target_crag_id" "uuid") O
 
 CREATE OR REPLACE FUNCTION "public"."increment_gear_click"("product_id_input" "text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
     BEGIN
       INSERT INTO public.product_clicks (product_id, click_count, updated_at)
@@ -637,6 +646,7 @@ ALTER FUNCTION "public"."initialize_climb_consensus"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."initialize_climb_grade_vote"("p_climb_id" "uuid", "p_user_id" "uuid", "p_grade" character varying) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 DECLARE
   v_count INTEGER;
@@ -677,6 +687,7 @@ ALTER FUNCTION "public"."initialize_climb_grade_vote"("p_climb_id" "uuid", "p_us
 
 CREATE OR REPLACE FUNCTION "public"."insert_grade_vote"("climb_id" "uuid", "vote_grade" character varying) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 BEGIN
   INSERT INTO grade_votes (climb_id, user_id, grade)
@@ -723,9 +734,45 @@ $$;
 ALTER FUNCTION "public"."is_profile_public"("user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") RETURNS "text"
+    LANGUAGE "plpgsql" IMMUTABLE
+    AS $$
+DECLARE
+  normalized TEXT;
+BEGIN
+  IF raw_type IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  normalized := lower(trim(replace(raw_type, '_', '-')));
+
+  IF normalized = 'bouldering' THEN
+    RETURN 'boulder';
+  ELSIF normalized = 'boulder' THEN
+    RETURN 'boulder';
+  ELSIF normalized = 'sport' THEN
+    RETURN 'sport';
+  ELSIF normalized = 'trad' THEN
+    RETURN 'trad';
+  ELSIF normalized = 'mixed' THEN
+    RETURN 'mixed';
+  ELSIF normalized = 'deep-water-solo' THEN
+    RETURN 'deep_water_solo';
+  ELSIF normalized = 'top-rope' THEN
+    RETURN 'top_rope';
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."recompute_crag_location"("target_crag_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 DECLARE
   avg_lat numeric;
@@ -756,6 +803,58 @@ $$;
 ALTER FUNCTION "public"."recompute_crag_location"("target_crag_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."refresh_crag_type_from_climbs"("target_crag_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  winner_type TEXT;
+  winner_count INTEGER;
+  has_tie BOOLEAN;
+BEGIN
+  IF target_crag_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  WITH normalized_counts AS (
+    SELECT
+      public.normalize_climb_route_type(c.route_type) AS normalized_type,
+      COUNT(*)::INTEGER AS route_count
+    FROM public.climbs c
+    WHERE c.crag_id = target_crag_id
+      AND c.deleted_at IS NULL
+      AND COALESCE(c.status, 'approved') = 'approved'
+    GROUP BY public.normalize_climb_route_type(c.route_type)
+    HAVING public.normalize_climb_route_type(c.route_type) IS NOT NULL
+  ), ranked AS (
+    SELECT
+      normalized_type,
+      route_count,
+      DENSE_RANK() OVER (ORDER BY route_count DESC) AS count_rank
+    FROM normalized_counts
+  )
+  SELECT
+    (SELECT normalized_type FROM ranked WHERE count_rank = 1 LIMIT 1),
+    (SELECT route_count FROM ranked WHERE count_rank = 1 LIMIT 1),
+    (SELECT COUNT(*) > 1 FROM ranked WHERE count_rank = 1)
+  INTO winner_type, winner_count, has_tie;
+
+  IF winner_type IS NULL OR winner_count IS NULL THEN
+    RETURN;
+  END IF;
+
+  UPDATE public.crags
+  SET type = CASE
+    WHEN has_tie THEN 'mixed'
+    ELSE winner_type
+  END
+  WHERE id = target_crag_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_crag_type_from_climbs"("target_crag_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."slugify"("input" "text") RETURNS "text"
     LANGUAGE "sql" IMMUTABLE
     AS $$
@@ -768,7 +867,7 @@ ALTER FUNCTION "public"."slugify"("input" "text") OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."soft_delete_comment"("p_comment_id" "uuid") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 DECLARE
   current_user_id UUID := auth.uid();
@@ -891,6 +990,28 @@ $$;
 ALTER FUNCTION "public"."sync_crag_to_place"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."sync_crag_type_from_climbs"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM public.refresh_crag_type_from_climbs(OLD.crag_id);
+    RETURN OLD;
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND OLD.crag_id IS DISTINCT FROM NEW.crag_id THEN
+    PERFORM public.refresh_crag_type_from_climbs(OLD.crag_id);
+  END IF;
+
+  PERFORM public.refresh_crag_type_from_climbs(NEW.crag_id);
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."sync_crag_type_from_climbs"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."sync_place_to_crag"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -983,6 +1104,7 @@ ALTER FUNCTION "public"."sync_place_to_crag"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."sync_profile_on_login"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 BEGIN
   IF NEW.email IS NOT NULL THEN
@@ -1106,7 +1228,7 @@ ALTER FUNCTION "public"."update_climb_consensus_safe"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."update_own_profile_submission_credit"("p_platform" "text", "p_handle" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $_$
 DECLARE
   current_user_id UUID := auth.uid();
@@ -1168,7 +1290,7 @@ ALTER FUNCTION "public"."update_own_profile_submission_credit"("p_platform" "tex
 
 CREATE OR REPLACE FUNCTION "public"."update_own_submission_credit"("p_image_id" "uuid", "p_platform" "text", "p_handle" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $_$
 DECLARE
   current_user_id UUID := auth.uid();
@@ -1237,7 +1359,7 @@ ALTER FUNCTION "public"."update_own_submission_credit"("p_image_id" "uuid", "p_p
 
 CREATE OR REPLACE FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid", "p_routes" "jsonb") RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'auth', 'extensions'
     AS $$
 DECLARE
   current_user_id UUID := auth.uid();
@@ -2445,6 +2567,10 @@ CREATE UNIQUE INDEX "uq_places_country_code_slug" ON "public"."places" USING "bt
 
 
 
+CREATE OR REPLACE TRIGGER "climbs_sync_crag_type_after_write" AFTER INSERT OR DELETE OR UPDATE OF "route_type", "crag_id", "status", "deleted_at" ON "public"."climbs" FOR EACH ROW EXECUTE FUNCTION "public"."sync_crag_type_from_climbs"();
+
+
+
 CREATE OR REPLACE TRIGGER "comments_soft_delete_only_trigger" BEFORE UPDATE ON "public"."comments" FOR EACH ROW EXECUTE FUNCTION "public"."enforce_comment_soft_delete_only"();
 
 
@@ -2731,7 +2857,7 @@ CREATE POLICY "Admins can manage admin actions" ON "public"."admin_actions" USIN
 
 
 
-CREATE POLICY "Authenticated create climb_flags" ON "public"."climb_flags" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
+CREATE POLICY "Authenticated create climb_flags" ON "public"."climb_flags" FOR INSERT WITH CHECK ((("auth"."role"() = 'authenticated'::"text") AND ("auth"."uid"() = "flagger_id")));
 
 
 
@@ -2739,11 +2865,11 @@ CREATE POLICY "Authenticated create comments" ON "public"."comments" FOR INSERT 
 
 
 
-CREATE POLICY "Authenticated create correction" ON "public"."climb_corrections" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
+CREATE POLICY "Authenticated create correction" ON "public"."climb_corrections" FOR INSERT WITH CHECK ((("auth"."role"() = 'authenticated'::"text") AND ("auth"."uid"() = "user_id")));
 
 
 
-CREATE POLICY "Authenticated create correction vote" ON "public"."correction_votes" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
+CREATE POLICY "Authenticated create correction vote" ON "public"."correction_votes" FOR INSERT WITH CHECK ((("auth"."role"() = 'authenticated'::"text") AND ("auth"."uid"() = "user_id")));
 
 
 
@@ -2755,7 +2881,7 @@ CREATE POLICY "Authenticated create crags" ON "public"."crags" FOR INSERT WITH C
 
 
 
-CREATE POLICY "Authenticated create grade vote" ON "public"."grade_votes" FOR INSERT WITH CHECK (("auth"."uid"() = "user_id"));
+CREATE POLICY "Authenticated create grade vote" ON "public"."grade_votes" FOR INSERT WITH CHECK ((("auth"."role"() = 'authenticated'::"text") AND ("auth"."uid"() = "user_id")));
 
 
 
@@ -2783,11 +2909,11 @@ CREATE POLICY "Authenticated create regions" ON "public"."regions" FOR INSERT WI
 
 
 
-CREATE POLICY "Authenticated create route grade" ON "public"."route_grades" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
+CREATE POLICY "Authenticated create route grade" ON "public"."route_grades" FOR INSERT WITH CHECK ((("auth"."role"() = 'authenticated'::"text") AND ("auth"."uid"() = "user_id")));
 
 
 
-CREATE POLICY "Authenticated create verification" ON "public"."climb_verifications" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
+CREATE POLICY "Authenticated create verification" ON "public"."climb_verifications" FOR INSERT WITH CHECK ((("auth"."role"() = 'authenticated'::"text") AND ("auth"."uid"() = "user_id")));
 
 
 
@@ -2983,6 +3109,10 @@ CREATE POLICY "Service role manage deleted accounts" ON "public"."deleted_accoun
 
 
 
+CREATE POLICY "Service role manage deletion requests" ON "public"."deletion_requests" TO "service_role" USING (true) WITH CHECK (true);
+
+
+
 CREATE POLICY "User read own notifications" ON "public"."notifications" FOR SELECT USING ((("auth"."uid"() = "user_id") OR (EXISTS ( SELECT 1
    FROM "public"."profiles"
   WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true))))));
@@ -3006,6 +3136,10 @@ CREATE POLICY "Users can view their own deletion requests" ON "public"."deletion
 
 
 CREATE POLICY "Users manage own community rsvps" ON "public"."community_post_rsvps" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users manage own deletion requests" ON "public"."deletion_requests" TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
 
 
 
@@ -5058,6 +5192,12 @@ GRANT ALL ON FUNCTION "public"."longtransactionsenabled"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."overlaps_2d"("public"."box2df", "public"."box2df") TO "postgres";
 GRANT ALL ON FUNCTION "public"."overlaps_2d"("public"."box2df", "public"."box2df") TO "anon";
 GRANT ALL ON FUNCTION "public"."overlaps_2d"("public"."box2df", "public"."box2df") TO "authenticated";
@@ -5579,6 +5719,12 @@ GRANT ALL ON FUNCTION "public"."postgis_wagyu_version"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."recompute_crag_location"("target_crag_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."recompute_crag_location"("target_crag_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."recompute_crag_location"("target_crag_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."refresh_crag_type_from_climbs"("target_crag_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."refresh_crag_type_from_climbs"("target_crag_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."refresh_crag_type_from_climbs"("target_crag_id" "uuid") TO "service_role";
 
 
 
@@ -8527,6 +8673,12 @@ GRANT ALL ON FUNCTION "public"."sync_crag_to_place"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."sync_crag_type_from_climbs"() TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_crag_type_from_climbs"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_crag_type_from_climbs"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."sync_place_to_crag"() TO "anon";
 GRANT ALL ON FUNCTION "public"."sync_place_to_crag"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."sync_place_to_crag"() TO "service_role";
@@ -8774,164 +8926,163 @@ GRANT ALL ON FUNCTION "public"."st_union"("public"."geometry", double precision)
 
 
 
-GRANT ALL ON TABLE "public"."admin_actions" TO "anon";
-GRANT ALL ON TABLE "public"."admin_actions" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."admin_actions" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."admin_actions" TO "authenticated";
 GRANT ALL ON TABLE "public"."admin_actions" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."climb_corrections" TO "anon";
-GRANT ALL ON TABLE "public"."climb_corrections" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."climb_corrections" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."climb_corrections" TO "authenticated";
 GRANT ALL ON TABLE "public"."climb_corrections" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."climb_flags" TO "anon";
-GRANT ALL ON TABLE "public"."climb_flags" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."climb_flags" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."climb_flags" TO "authenticated";
 GRANT ALL ON TABLE "public"."climb_flags" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."climb_verifications" TO "anon";
-GRANT ALL ON TABLE "public"."climb_verifications" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."climb_verifications" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."climb_verifications" TO "authenticated";
 GRANT ALL ON TABLE "public"."climb_verifications" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."climb_video_betas" TO "anon";
-GRANT ALL ON TABLE "public"."climb_video_betas" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."climb_video_betas" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."climb_video_betas" TO "authenticated";
 GRANT ALL ON TABLE "public"."climb_video_betas" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."climbs" TO "anon";
-GRANT ALL ON TABLE "public"."climbs" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."climbs" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."climbs" TO "authenticated";
 GRANT ALL ON TABLE "public"."climbs" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."comments" TO "anon";
-GRANT ALL ON TABLE "public"."comments" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."comments" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."comments" TO "authenticated";
 GRANT ALL ON TABLE "public"."comments" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."community_place_follows" TO "anon";
-GRANT ALL ON TABLE "public"."community_place_follows" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."community_place_follows" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."community_place_follows" TO "authenticated";
 GRANT ALL ON TABLE "public"."community_place_follows" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."community_post_comments" TO "anon";
-GRANT ALL ON TABLE "public"."community_post_comments" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."community_post_comments" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."community_post_comments" TO "authenticated";
 GRANT ALL ON TABLE "public"."community_post_comments" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."community_post_rsvps" TO "anon";
-GRANT ALL ON TABLE "public"."community_post_rsvps" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."community_post_rsvps" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."community_post_rsvps" TO "authenticated";
 GRANT ALL ON TABLE "public"."community_post_rsvps" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."community_posts" TO "anon";
-GRANT ALL ON TABLE "public"."community_posts" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."community_posts" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."community_posts" TO "authenticated";
 GRANT ALL ON TABLE "public"."community_posts" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."correction_votes" TO "anon";
-GRANT ALL ON TABLE "public"."correction_votes" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."correction_votes" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."correction_votes" TO "authenticated";
 GRANT ALL ON TABLE "public"."correction_votes" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."crag_reports" TO "anon";
-GRANT ALL ON TABLE "public"."crag_reports" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."crag_reports" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."crag_reports" TO "authenticated";
 GRANT ALL ON TABLE "public"."crag_reports" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."crags" TO "anon";
-GRANT ALL ON TABLE "public"."crags" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."crags" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."crags" TO "authenticated";
 GRANT ALL ON TABLE "public"."crags" TO "service_role";
 
 
 
-GRANT REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."deleted_accounts" TO "anon";
-GRANT REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."deleted_accounts" TO "authenticated";
+GRANT MAINTAIN ON TABLE "public"."deleted_accounts" TO "anon";
+GRANT MAINTAIN ON TABLE "public"."deleted_accounts" TO "authenticated";
 GRANT ALL ON TABLE "public"."deleted_accounts" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."deletion_requests" TO "anon";
-GRANT ALL ON TABLE "public"."deletion_requests" TO "authenticated";
 GRANT ALL ON TABLE "public"."deletion_requests" TO "service_role";
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE "public"."deletion_requests" TO "authenticated";
 
 
 
-GRANT ALL ON TABLE "public"."grade_votes" TO "anon";
-GRANT ALL ON TABLE "public"."grade_votes" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."grade_votes" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."grade_votes" TO "authenticated";
 GRANT ALL ON TABLE "public"."grade_votes" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."grades" TO "anon";
-GRANT ALL ON TABLE "public"."grades" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."grades" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."grades" TO "authenticated";
 GRANT ALL ON TABLE "public"."grades" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."images" TO "anon";
-GRANT ALL ON TABLE "public"."images" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."images" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."images" TO "authenticated";
 GRANT ALL ON TABLE "public"."images" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."notifications" TO "anon";
-GRANT ALL ON TABLE "public"."notifications" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."notifications" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."notifications" TO "authenticated";
 GRANT ALL ON TABLE "public"."notifications" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."places" TO "anon";
-GRANT ALL ON TABLE "public"."places" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."places" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."places" TO "authenticated";
 GRANT ALL ON TABLE "public"."places" TO "service_role";
 
 
 
-GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."product_clicks" TO "anon";
-GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."product_clicks" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."product_clicks" TO "anon";
+GRANT SELECT,MAINTAIN ON TABLE "public"."product_clicks" TO "authenticated";
 GRANT ALL ON TABLE "public"."product_clicks" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."profiles" TO "anon";
-GRANT ALL ON TABLE "public"."profiles" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."profiles" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."profiles" TO "authenticated";
 GRANT ALL ON TABLE "public"."profiles" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."regions" TO "anon";
-GRANT ALL ON TABLE "public"."regions" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."regions" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."regions" TO "authenticated";
 GRANT ALL ON TABLE "public"."regions" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."route_grades" TO "anon";
-GRANT ALL ON TABLE "public"."route_grades" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."route_grades" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."route_grades" TO "authenticated";
 GRANT ALL ON TABLE "public"."route_grades" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."route_lines" TO "anon";
-GRANT ALL ON TABLE "public"."route_lines" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."route_lines" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."route_lines" TO "authenticated";
 GRANT ALL ON TABLE "public"."route_lines" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."user_climbs" TO "anon";
-GRANT ALL ON TABLE "public"."user_climbs" TO "authenticated";
+GRANT SELECT,MAINTAIN ON TABLE "public"."user_climbs" TO "anon";
+GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."user_climbs" TO "authenticated";
 GRANT ALL ON TABLE "public"."user_climbs" TO "service_role";
 
 
