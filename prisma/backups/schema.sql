@@ -121,27 +121,75 @@ $$;
 ALTER FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval, "max_delete" integer) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."climbs_recompute_crag_location_trigger"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.crag_id IS NOT NULL THEN
+      PERFORM public.recompute_crag_location(NEW.crag_id);
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    IF OLD.crag_id IS NOT NULL AND OLD.crag_id <> NEW.crag_id THEN
+      PERFORM public.recompute_crag_location(OLD.crag_id);
+    END IF;
+    IF NEW.crag_id IS NOT NULL AND (OLD.latitude IS DISTINCT FROM NEW.latitude OR OLD.longitude IS DISTINCT FROM NEW.longitude OR OLD.crag_id IS DISTINCT FROM NEW.crag_id) THEN
+      PERFORM public.recompute_crag_location(NEW.crag_id);
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.crag_id IS NOT NULL THEN
+      PERFORM public.recompute_crag_location(OLD.crag_id);
+    END IF;
+    RETURN OLD;
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."climbs_recompute_crag_location_trigger"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."delete_empty_crag"("target_crag_id" "uuid", "grace_period" interval DEFAULT '24:00:00'::interval) RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'auth', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
 DECLARE
   deleted_count integer := 0;
+  crag_exists boolean := false;
 BEGIN
   IF target_crag_id IS NULL THEN
     RETURN false;
   END IF;
 
-  DELETE FROM public.crags c
-  WHERE c.id = target_crag_id
-    AND c.created_at < now() - grace_period
-    AND NOT EXISTS (
-      SELECT 1
-      FROM public.images i
-      WHERE i.crag_id = c.id
-    );
+  -- Check if crag exists and meets deletion criteria
+  SELECT EXISTS (
+    SELECT 1 FROM public.crags c
+    WHERE c.id = target_crag_id
+      AND c.created_at < now() - grace_period
+      AND NOT EXISTS (
+        SELECT 1 FROM public.images i WHERE i.crag_id = c.id
+      )
+  ) INTO crag_exists;
 
-  GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  IF crag_exists THEN
+    -- Delete from places table first (sync trigger doesn't fire from function)
+    DELETE FROM public.places WHERE id = target_crag_id AND type = 'crag';
+    
+    -- Delete the crag (this will cascade delete climbs)
+    DELETE FROM public.crags WHERE id = target_crag_id;
+    
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  END IF;
+
   RETURN deleted_count > 0;
 END;
 $$;
@@ -329,6 +377,62 @@ $$;
 
 
 ALTER FUNCTION "public"."get_consensus_grade"("climb_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_crag_pins"() RETURNS TABLE("id" "uuid", "name" "text", "latitude" numeric, "longitude" numeric, "image_count" bigint)
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  RETURN QUERY
+  SELECT 
+    c.id,
+    c.name::TEXT,
+    AVG(i.latitude)::NUMERIC(10,8) AS latitude,
+    AVG(i.longitude)::NUMERIC(11,8) AS longitude,
+    COUNT(i.id)::BIGINT AS image_count
+  FROM public.crags c
+  INNER JOIN public.images i ON i.crag_id = c.id 
+    AND i.status = 'approved' 
+    AND i.latitude IS NOT NULL
+    AND i.longitude IS NOT NULL
+  GROUP BY c.id, c.name
+  HAVING COUNT(i.id) > 0;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_crag_pins"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_crag_pins"("include_pending" boolean DEFAULT false) RETURNS TABLE("id" "uuid", "name" "text", "latitude" numeric, "longitude" numeric, "image_count" bigint)
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    c.id,
+    c.name::TEXT,
+    AVG(i.latitude)::NUMERIC(10,8) AS latitude,
+    AVG(i.longitude)::NUMERIC(11,8) AS longitude,
+    COUNT(i.id)::BIGINT AS image_count
+  FROM public.crags c
+  INNER JOIN public.images i ON i.crag_id = c.id
+    AND i.status != 'deleted'
+    AND (
+      i.status = 'approved'
+      OR (include_pending AND i.status = 'pending')
+    )
+    AND i.latitude IS NOT NULL
+    AND i.longitude IS NOT NULL
+  GROUP BY c.id, c.name
+  HAVING COUNT(i.id) > 0;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_crag_pins"("include_pending" boolean) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_grade_vote_distribution"("climb_id" "uuid") RETURNS TABLE("grade" character varying, "vote_count" integer)
@@ -520,7 +624,7 @@ ALTER FUNCTION "public"."handle_user_metadata_update"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."images_recompute_crag_location_trigger"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'auth', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
@@ -532,7 +636,7 @@ BEGIN
     IF NEW.crag_id IS DISTINCT FROM OLD.crag_id THEN
       PERFORM public.recompute_crag_location(OLD.crag_id);
       PERFORM public.recompute_crag_location(NEW.crag_id);
-      PERFORM public.delete_empty_crag(OLD.crag_id, interval '24 hours');
+      PERFORM public.delete_empty_crag(OLD.crag_id, interval '0 seconds');
       RETURN NEW;
     END IF;
 
@@ -546,7 +650,7 @@ BEGIN
 
   IF TG_OP = 'DELETE' THEN
     PERFORM public.recompute_crag_location(OLD.crag_id);
-    PERFORM public.delete_empty_crag(OLD.crag_id, interval '24 hours');
+    PERFORM public.delete_empty_crag(OLD.crag_id, interval '0 seconds');
     RETURN OLD;
   END IF;
 
@@ -770,9 +874,87 @@ $$;
 ALTER FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."recompute_climb_location_from_image"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  target_climb_id uuid;
+  img_lat numeric(10,8);
+  img_lng numeric(11,8);
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    target_climb_id := NEW.climb_id;
+  ELSIF TG_OP = 'UPDATE' THEN
+    target_climb_id := NEW.climb_id;
+  ELSIF TG_OP = 'DELETE' THEN
+    target_climb_id := OLD.climb_id;
+  ELSE
+    RETURN OLD;
+  END IF;
+
+  IF target_climb_id IS NULL THEN
+    IF TG_OP = 'DELETE' THEN
+      RETURN OLD;
+    ELSE
+      RETURN NEW;
+    END IF;
+  END IF;
+
+  SELECT i.latitude, i.longitude
+  INTO img_lat, img_lng
+  FROM public.route_lines rl
+  JOIN public.images i ON i.id = rl.image_id
+  WHERE rl.climb_id = target_climb_id
+  ORDER BY rl.created_at ASC
+  LIMIT 1;
+
+  UPDATE public.climbs c
+  SET latitude = img_lat,
+      longitude = img_lng
+  WHERE c.id = target_climb_id;
+
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."recompute_climb_location_from_image"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."recompute_crag_counts"() RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  UPDATE public.crags c SET
+    image_count = (
+      SELECT COUNT(*)::INTEGER 
+      FROM public.images i 
+      WHERE i.crag_id = c.id 
+        AND i.status = 'approved' 
+        AND i.latitude IS NOT NULL
+    ),
+    route_count = (
+      SELECT COUNT(*)::INTEGER 
+      FROM public.climbs cl 
+      WHERE cl.crag_id = c.id 
+        AND cl.status = 'approved'
+    );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."recompute_crag_counts"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."recompute_crag_location"("target_crag_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'auth', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
 DECLARE
   avg_lat numeric;
@@ -782,20 +964,31 @@ BEGIN
     RETURN;
   END IF;
 
+  -- Average position from both climbs AND approved images
   SELECT
-    avg(i.latitude),
-    avg(i.longitude)
+    avg(combined.lat),
+    avg(combined.lng)
   INTO avg_lat, avg_lng
-  FROM public.images i
-  WHERE i.crag_id = target_crag_id
-    AND i.latitude IS NOT NULL
-    AND i.longitude IS NOT NULL;
+  FROM (
+    SELECT c.latitude AS lat, c.longitude AS lng
+    FROM public.climbs c
+    WHERE c.crag_id = target_crag_id
+      AND c.latitude IS NOT NULL
+      AND c.longitude IS NOT NULL
+    UNION ALL
+    SELECT i.latitude AS lat, i.longitude AS lng
+    FROM public.images i
+    WHERE i.crag_id = target_crag_id
+      AND i.status = 'approved'
+      AND i.latitude IS NOT NULL
+      AND i.longitude IS NOT NULL
+  ) combined;
 
-  UPDATE public.crags c
+  UPDATE public.crags cr
   SET
     latitude = CASE WHEN avg_lat IS NULL THEN NULL ELSE avg_lat::numeric(10,8) END,
     longitude = CASE WHEN avg_lng IS NULL THEN NULL ELSE avg_lng::numeric(11,8) END
-  WHERE c.id = target_crag_id;
+  WHERE cr.id = target_crag_id;
 END;
 $$;
 
@@ -924,7 +1117,6 @@ BEGIN
     description,
     access_notes,
     rock_type,
-    boundary,
     region_name,
     country,
     country_code,
@@ -947,7 +1139,6 @@ BEGIN
     NEW.description,
     NEW.access_notes,
     NEW.rock_type,
-    NEW.boundary,
     NEW.region_name,
     NEW.country,
     NEW.country_code,
@@ -970,7 +1161,6 @@ BEGIN
     description = EXCLUDED.description,
     access_notes = EXCLUDED.access_notes,
     rock_type = EXCLUDED.rock_type,
-    boundary = EXCLUDED.boundary,
     region_name = EXCLUDED.region_name,
     country = EXCLUDED.country,
     country_code = EXCLUDED.country_code,
@@ -1119,6 +1309,77 @@ $$;
 
 
 ALTER FUNCTION "public"."sync_profile_on_login"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trigger_recompute_crag_counts_climbs"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  target_crag_id UUID;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    target_crag_id := OLD.crag_id;
+  ELSE
+    target_crag_id := NEW.crag_id;
+  END IF;
+
+  IF target_crag_id IS NOT NULL THEN
+    UPDATE public.crags c SET
+      route_count = (
+        SELECT COUNT(*)::INTEGER 
+        FROM public.climbs cl 
+        WHERE cl.crag_id = c.id 
+          AND cl.status = 'approved'
+      )
+    WHERE c.id = target_crag_id;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trigger_recompute_crag_counts_climbs"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trigger_recompute_crag_counts_images"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  target_crag_id UUID;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    target_crag_id := OLD.crag_id;
+  ELSE
+    target_crag_id := NEW.crag_id;
+  END IF;
+
+  IF target_crag_id IS NOT NULL THEN
+    UPDATE public.crags c SET
+      image_count = (
+        SELECT COUNT(*)::INTEGER 
+        FROM public.images i 
+        WHERE i.crag_id = c.id 
+          AND i.status = 'approved' 
+          AND i.latitude IS NOT NULL
+      )
+    WHERE c.id = target_crag_id;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trigger_recompute_crag_counts_images"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_climb_consensus"() RETURNS "trigger"
@@ -1608,7 +1869,11 @@ CREATE TABLE IF NOT EXISTS "public"."climbs" (
     "consensus_grade" character varying(10),
     "total_votes" integer DEFAULT 0,
     "grade_tied" boolean DEFAULT false,
-    "place_id" "uuid"
+    "place_id" "uuid",
+    "latitude" numeric(10,8),
+    "longitude" numeric(11,8),
+    "grade_index" integer,
+    "original_grade_string" character varying(24)
 );
 
 
@@ -1745,12 +2010,13 @@ CREATE TABLE IF NOT EXISTS "public"."crags" (
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "report_count" integer DEFAULT 0,
     "is_flagged" boolean DEFAULT false,
-    "boundary" "public"."geometry"(Polygon,4326),
     "region_name" character varying(100),
     "country" character varying(100),
     "tide_dependency" character varying(20),
     "country_code" character varying(2),
-    "slug" "text"
+    "slug" "text",
+    "image_count" integer DEFAULT 0,
+    "route_count" integer DEFAULT 0
 );
 
 
@@ -1785,6 +2051,20 @@ CREATE TABLE IF NOT EXISTS "public"."deletion_requests" (
 ALTER TABLE "public"."deletion_requests" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."grade_mappings" (
+    "grade_index" integer NOT NULL,
+    "v_scale" character varying(10),
+    "font_scale" character varying(10),
+    "yds_equivalent" character varying(10),
+    "french_equivalent" character varying(10),
+    "difficulty_group" character varying(20),
+    "british_equivalent" character varying(10)
+);
+
+
+ALTER TABLE "public"."grade_mappings" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."grade_votes" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "climb_id" "uuid" NOT NULL,
@@ -1804,6 +2084,108 @@ CREATE TABLE IF NOT EXISTS "public"."grades" (
 
 
 ALTER TABLE "public"."grades" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."gym_floor_plans" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "gym_place_id" "uuid" NOT NULL,
+    "name" "text" NOT NULL,
+    "image_url" "text" NOT NULL,
+    "image_width" integer NOT NULL,
+    "image_height" integer NOT NULL,
+    "is_active" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "gym_floor_plans_image_height_check" CHECK (("image_height" > 0)),
+    CONSTRAINT "gym_floor_plans_image_width_check" CHECK (("image_width" > 0)),
+    CONSTRAINT "gym_floor_plans_name_check" CHECK ((("char_length"("name") >= 1) AND ("char_length"("name") <= 160)))
+);
+
+
+ALTER TABLE "public"."gym_floor_plans" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."gym_memberships" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "gym_place_id" "uuid" NOT NULL,
+    "role" "text" NOT NULL,
+    "status" "text" DEFAULT 'active'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "gym_memberships_role_check" CHECK (("role" = ANY (ARRAY['owner'::"text", 'manager'::"text", 'head_setter'::"text", 'setter'::"text"]))),
+    CONSTRAINT "gym_memberships_status_check" CHECK (("status" = ANY (ARRAY['active'::"text", 'invited'::"text", 'revoked'::"text"])))
+);
+
+
+ALTER TABLE "public"."gym_memberships" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."gym_owner_applications" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "gym_name" "text" NOT NULL,
+    "address" "text" NOT NULL,
+    "facilities" "text"[] NOT NULL,
+    "contact_phone" "text" NOT NULL,
+    "contact_email" "text" NOT NULL,
+    "role" "text" NOT NULL,
+    "additional_comments" "text",
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "city" "text" NOT NULL,
+    "country" "text" NOT NULL,
+    "postcode_or_zip" "text" NOT NULL,
+    CONSTRAINT "gym_owner_applications_address_check" CHECK ((("char_length"("address") >= 1) AND ("char_length"("address") <= 300))),
+    CONSTRAINT "gym_owner_applications_city_length" CHECK ((("char_length"("city") >= 1) AND ("char_length"("city") <= 120))),
+    CONSTRAINT "gym_owner_applications_contact_email_check" CHECK ((("char_length"("contact_email") >= 3) AND ("char_length"("contact_email") <= 160))),
+    CONSTRAINT "gym_owner_applications_contact_phone_check" CHECK ((("char_length"("contact_phone") >= 1) AND ("char_length"("contact_phone") <= 40))),
+    CONSTRAINT "gym_owner_applications_country_length" CHECK ((("char_length"("country") >= 1) AND ("char_length"("country") <= 120))),
+    CONSTRAINT "gym_owner_applications_facilities_not_empty" CHECK (("cardinality"("facilities") >= 1)),
+    CONSTRAINT "gym_owner_applications_facilities_valid" CHECK (("facilities" <@ ARRAY['sport'::"text", 'boulder'::"text"])),
+    CONSTRAINT "gym_owner_applications_gym_name_check" CHECK ((("char_length"("gym_name") >= 1) AND ("char_length"("gym_name") <= 200))),
+    CONSTRAINT "gym_owner_applications_postcode_or_zip_length" CHECK ((("char_length"("postcode_or_zip") >= 1) AND ("char_length"("postcode_or_zip") <= 32))),
+    CONSTRAINT "gym_owner_applications_role_check" CHECK (("role" = ANY (ARRAY['owner'::"text", 'manager'::"text", 'head_setter'::"text"]))),
+    CONSTRAINT "gym_owner_applications_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'reviewing'::"text", 'approved'::"text", 'rejected'::"text"])))
+);
+
+
+ALTER TABLE "public"."gym_owner_applications" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."gym_route_markers" (
+    "route_id" "uuid" NOT NULL,
+    "x_norm" numeric(8,6) NOT NULL,
+    "y_norm" numeric(8,6) NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "gym_route_markers_x_norm_check" CHECK ((("x_norm" >= (0)::numeric) AND ("x_norm" <= (1)::numeric))),
+    CONSTRAINT "gym_route_markers_y_norm_check" CHECK ((("y_norm" >= (0)::numeric) AND ("y_norm" <= (1)::numeric)))
+);
+
+
+ALTER TABLE "public"."gym_route_markers" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."gym_routes" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "gym_place_id" "uuid" NOT NULL,
+    "floor_plan_id" "uuid" NOT NULL,
+    "name" "text",
+    "grade" "text" NOT NULL,
+    "discipline" "text" NOT NULL,
+    "color" "text",
+    "setter_name" "text",
+    "status" "text" DEFAULT 'active'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "gym_routes_discipline_check" CHECK (("discipline" = ANY (ARRAY['boulder'::"text", 'sport'::"text", 'top_rope'::"text", 'mixed'::"text"]))),
+    CONSTRAINT "gym_routes_grade_check" CHECK ((("char_length"("grade") >= 1) AND ("char_length"("grade") <= 24))),
+    CONSTRAINT "gym_routes_status_check" CHECK (("status" = ANY (ARRAY['active'::"text", 'retired'::"text"])))
+);
+
+
+ALTER TABLE "public"."gym_routes" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."images" (
@@ -1835,7 +2217,7 @@ CREATE TABLE IF NOT EXISTS "public"."images" (
     "contribution_credit_handle" "text",
     CONSTRAINT "images_face_direction_check" CHECK ((("face_direction" IS NULL) OR (("face_direction")::"text" = ANY ((ARRAY['N'::character varying, 'NE'::character varying, 'E'::character varying, 'SE'::character varying, 'S'::character varying, 'SW'::character varying, 'W'::character varying, 'NW'::character varying])::"text"[])))),
     CONSTRAINT "images_face_directions_check" CHECK ((("face_directions" IS NULL) OR ("face_directions" <@ ARRAY['N'::"text", 'NE'::"text", 'E'::"text", 'SE'::"text", 'S'::"text", 'SW'::"text", 'W'::"text", 'NW'::"text"]))),
-    CONSTRAINT "images_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying])::"text"[])))
+    CONSTRAINT "images_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying, 'deleted'::character varying])::"text"[])))
 );
 
 
@@ -1922,7 +2304,7 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "default_location_lat" numeric(10,8),
     "default_location_lng" numeric(11,8),
     "default_location_zoom" integer,
-    "grade_system" character varying(10) DEFAULT 'font'::character varying,
+    "grade_system" character varying(20) DEFAULT 'font'::character varying,
     "units" character varying(10) DEFAULT 'metric'::character varying,
     "is_public" boolean DEFAULT true,
     "theme_preference" character varying(20) DEFAULT 'system'::character varying,
@@ -1937,6 +2319,9 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "reach_cm" integer,
     "contribution_credit_platform" "text",
     "contribution_credit_handle" "text",
+    "boulder_system" character varying(20) DEFAULT 'v_scale'::character varying,
+    "route_system" character varying(20) DEFAULT 'yds_equivalent'::character varying,
+    "trad_system" character varying(20) DEFAULT 'yds_equivalent'::character varying,
     CONSTRAINT "profiles_gender_check" CHECK (("gender" = ANY (ARRAY['male'::"text", 'female'::"text", 'other'::"text", 'prefer_not_to_say'::"text"]))),
     CONSTRAINT "profiles_height_cm_check" CHECK ((("height_cm" IS NULL) OR (("height_cm" >= 100) AND ("height_cm" <= 250)))),
     CONSTRAINT "profiles_reach_cm_check" CHECK ((("reach_cm" IS NULL) OR (("reach_cm" >= 100) AND ("reach_cm" <= 260))))
@@ -2103,6 +2488,11 @@ ALTER TABLE ONLY "public"."deletion_requests"
 
 
 
+ALTER TABLE ONLY "public"."grade_mappings"
+    ADD CONSTRAINT "grade_mappings_pkey" PRIMARY KEY ("grade_index");
+
+
+
 ALTER TABLE ONLY "public"."grade_votes"
     ADD CONSTRAINT "grade_votes_climb_id_user_id_key" UNIQUE ("climb_id", "user_id");
 
@@ -2115,6 +2505,31 @@ ALTER TABLE ONLY "public"."grade_votes"
 
 ALTER TABLE ONLY "public"."grades"
     ADD CONSTRAINT "grades_pkey" PRIMARY KEY ("grade");
+
+
+
+ALTER TABLE ONLY "public"."gym_floor_plans"
+    ADD CONSTRAINT "gym_floor_plans_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."gym_memberships"
+    ADD CONSTRAINT "gym_memberships_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."gym_owner_applications"
+    ADD CONSTRAINT "gym_owner_applications_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."gym_route_markers"
+    ADD CONSTRAINT "gym_route_markers_pkey" PRIMARY KEY ("route_id");
+
+
+
+ALTER TABLE ONLY "public"."gym_routes"
+    ADD CONSTRAINT "gym_routes_pkey" PRIMARY KEY ("id");
 
 
 
@@ -2251,6 +2666,10 @@ CREATE INDEX "idx_climbs_grade" ON "public"."climbs" USING "btree" ("grade");
 
 
 
+CREATE INDEX "idx_climbs_grade_index" ON "public"."climbs" USING "btree" ("grade_index");
+
+
+
 CREATE INDEX "idx_climbs_name" ON "public"."climbs" USING "btree" ("name");
 
 
@@ -2335,11 +2754,11 @@ CREATE INDEX "idx_crag_reports_status" ON "public"."crag_reports" USING "btree" 
 
 
 
-CREATE INDEX "idx_crags_boundary" ON "public"."crags" USING "gist" ("boundary");
-
-
-
 CREATE INDEX "idx_crags_country_code" ON "public"."crags" USING "btree" ("country_code");
+
+
+
+CREATE INDEX "idx_crags_image_count" ON "public"."crags" USING "btree" ("image_count");
 
 
 
@@ -2355,11 +2774,19 @@ CREATE INDEX "idx_crags_name" ON "public"."crags" USING "btree" ("name");
 
 
 
+CREATE INDEX "idx_crags_nearby_cover" ON "public"."crags" USING "btree" ("latitude", "longitude") INCLUDE ("id", "name", "rock_type", "type");
+
+
+
 CREATE INDEX "idx_crags_region" ON "public"."crags" USING "btree" ("region_id");
 
 
 
 CREATE INDEX "idx_crags_report_count" ON "public"."crags" USING "btree" ("report_count");
+
+
+
+CREATE INDEX "idx_crags_route_count" ON "public"."crags" USING "btree" ("route_count");
 
 
 
@@ -2396,6 +2823,38 @@ CREATE INDEX "idx_grade_votes_user" ON "public"."grade_votes" USING "btree" ("us
 
 
 CREATE INDEX "idx_grades_points" ON "public"."grades" USING "btree" ("points");
+
+
+
+CREATE INDEX "idx_gym_floor_plans_gym" ON "public"."gym_floor_plans" USING "btree" ("gym_place_id");
+
+
+
+CREATE INDEX "idx_gym_memberships_gym_status" ON "public"."gym_memberships" USING "btree" ("gym_place_id", "status");
+
+
+
+CREATE INDEX "idx_gym_memberships_user_status" ON "public"."gym_memberships" USING "btree" ("user_id", "status");
+
+
+
+CREATE INDEX "idx_gym_owner_applications_created" ON "public"."gym_owner_applications" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "idx_gym_owner_applications_status_created" ON "public"."gym_owner_applications" USING "btree" ("status", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_gym_routes_floor_plan" ON "public"."gym_routes" USING "btree" ("floor_plan_id");
+
+
+
+CREATE INDEX "idx_gym_routes_gym" ON "public"."gym_routes" USING "btree" ("gym_place_id");
+
+
+
+CREATE INDEX "idx_gym_routes_status" ON "public"."gym_routes" USING "btree" ("status");
 
 
 
@@ -2563,7 +3022,27 @@ CREATE UNIQUE INDEX "uq_crags_country_code_slug" ON "public"."crags" USING "btre
 
 
 
+CREATE UNIQUE INDEX "uq_gym_floor_plans_one_active_per_gym" ON "public"."gym_floor_plans" USING "btree" ("gym_place_id") WHERE ("is_active" = true);
+
+
+
+CREATE UNIQUE INDEX "uq_gym_memberships_user_gym" ON "public"."gym_memberships" USING "btree" ("user_id", "gym_place_id");
+
+
+
 CREATE UNIQUE INDEX "uq_places_country_code_slug" ON "public"."places" USING "btree" ("country_code", "slug") WHERE (("country_code" IS NOT NULL) AND ("slug" IS NOT NULL));
+
+
+
+CREATE OR REPLACE TRIGGER "climbs_recompute_crag_location_delete" AFTER DELETE ON "public"."climbs" FOR EACH ROW EXECUTE FUNCTION "public"."climbs_recompute_crag_location_trigger"();
+
+
+
+CREATE OR REPLACE TRIGGER "climbs_recompute_crag_location_insert" AFTER INSERT ON "public"."climbs" FOR EACH ROW EXECUTE FUNCTION "public"."climbs_recompute_crag_location_trigger"();
+
+
+
+CREATE OR REPLACE TRIGGER "climbs_recompute_crag_location_update" AFTER UPDATE OF "crag_id", "latitude", "longitude" ON "public"."climbs" FOR EACH ROW EXECUTE FUNCTION "public"."climbs_recompute_crag_location_trigger"();
 
 
 
@@ -2583,15 +3062,7 @@ CREATE OR REPLACE TRIGGER "crags_sync_to_places_after_write" AFTER INSERT OR DEL
 
 
 
-CREATE OR REPLACE TRIGGER "images_recompute_crag_location_delete" AFTER DELETE ON "public"."images" FOR EACH ROW EXECUTE FUNCTION "public"."images_recompute_crag_location_trigger"();
-
-
-
-CREATE OR REPLACE TRIGGER "images_recompute_crag_location_insert" AFTER INSERT ON "public"."images" FOR EACH ROW EXECUTE FUNCTION "public"."images_recompute_crag_location_trigger"();
-
-
-
-CREATE OR REPLACE TRIGGER "images_recompute_crag_location_update" AFTER UPDATE OF "crag_id", "latitude", "longitude" ON "public"."images" FOR EACH ROW EXECUTE FUNCTION "public"."images_recompute_crag_location_trigger"();
+CREATE OR REPLACE TRIGGER "images_trigger_on_crag_location" AFTER INSERT OR DELETE OR UPDATE ON "public"."images" FOR EACH ROW EXECUTE FUNCTION "public"."images_recompute_crag_location_trigger"();
 
 
 
@@ -2599,7 +3070,19 @@ CREATE OR REPLACE TRIGGER "places_sync_to_crags_after_write" AFTER INSERT OR DEL
 
 
 
+CREATE OR REPLACE TRIGGER "route_lines_set_climb_gps" AFTER INSERT OR UPDATE OF "image_id" ON "public"."route_lines" FOR EACH ROW EXECUTE FUNCTION "public"."recompute_climb_location_from_image"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_update_climb_consensus_on_vote" AFTER INSERT OR DELETE OR UPDATE ON "public"."grade_votes" FOR EACH ROW EXECUTE FUNCTION "public"."update_climb_consensus_safe"();
+
+
+
+CREATE OR REPLACE TRIGGER "trigger_crag_counts_climbs" AFTER INSERT OR DELETE OR UPDATE OF "status" ON "public"."climbs" FOR EACH ROW EXECUTE FUNCTION "public"."trigger_recompute_crag_counts_climbs"();
+
+
+
+CREATE OR REPLACE TRIGGER "trigger_crag_counts_images" AFTER INSERT OR DELETE OR UPDATE OF "status" ON "public"."images" FOR EACH ROW EXECUTE FUNCTION "public"."trigger_recompute_crag_counts_images"();
 
 
 
@@ -2660,6 +3143,11 @@ ALTER TABLE ONLY "public"."climb_video_betas"
 
 ALTER TABLE ONLY "public"."climbs"
     ADD CONSTRAINT "climbs_crag_id_fkey" FOREIGN KEY ("crag_id") REFERENCES "public"."crags"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."climbs"
+    ADD CONSTRAINT "climbs_grade_index_fkey" FOREIGN KEY ("grade_index") REFERENCES "public"."grade_mappings"("grade_index");
 
 
 
@@ -2758,6 +3246,36 @@ ALTER TABLE ONLY "public"."grade_votes"
 
 
 
+ALTER TABLE ONLY "public"."gym_floor_plans"
+    ADD CONSTRAINT "gym_floor_plans_gym_place_id_fkey" FOREIGN KEY ("gym_place_id") REFERENCES "public"."places"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."gym_memberships"
+    ADD CONSTRAINT "gym_memberships_gym_place_id_fkey" FOREIGN KEY ("gym_place_id") REFERENCES "public"."places"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."gym_memberships"
+    ADD CONSTRAINT "gym_memberships_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."gym_route_markers"
+    ADD CONSTRAINT "gym_route_markers_route_id_fkey" FOREIGN KEY ("route_id") REFERENCES "public"."gym_routes"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."gym_routes"
+    ADD CONSTRAINT "gym_routes_floor_plan_id_fkey" FOREIGN KEY ("floor_plan_id") REFERENCES "public"."gym_floor_plans"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."gym_routes"
+    ADD CONSTRAINT "gym_routes_gym_place_id_fkey" FOREIGN KEY ("gym_place_id") REFERENCES "public"."places"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."images"
     ADD CONSTRAINT "images_crag_id_fkey" FOREIGN KEY ("crag_id") REFERENCES "public"."crags"("id") ON DELETE CASCADE;
 
@@ -2827,11 +3345,49 @@ CREATE POLICY "Admin read all notifications" ON "public"."notifications" FOR SEL
 
 
 
+CREATE POLICY "Admin read gym owner applications" ON "public"."gym_owner_applications" FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true)))));
+
+
+
+CREATE POLICY "Admin update gym owner applications" ON "public"."gym_owner_applications" FOR UPDATE USING ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true)))));
+
+
+
 CREATE POLICY "Admin update profiles" ON "public"."profiles" FOR UPDATE USING ((EXISTS ( SELECT 1
    FROM "public"."profiles" "profiles_1"
   WHERE (("profiles_1"."id" = "auth"."uid"()) AND ("profiles_1"."is_admin" = true))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."profiles" "profiles_1"
   WHERE (("profiles_1"."id" = "auth"."uid"()) AND ("profiles_1"."is_admin" = true)))));
+
+
+
+CREATE POLICY "Admin write gym_floor_plans" ON "public"."gym_floor_plans" USING ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true)))));
+
+
+
+CREATE POLICY "Admin write gym_route_markers" ON "public"."gym_route_markers" USING ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true)))));
+
+
+
+CREATE POLICY "Admin write gym_routes" ON "public"."gym_routes" USING ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true)))));
 
 
 
@@ -2854,6 +3410,14 @@ CREATE POLICY "Admins can delete images" ON "public"."images" FOR DELETE USING (
 
 
 CREATE POLICY "Admins can manage admin actions" ON "public"."admin_actions" USING ((("auth"."jwt"() ->> 'role'::"text") = 'admin'::"text"));
+
+
+
+CREATE POLICY "Admins manage gym memberships" ON "public"."gym_memberships" USING ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."profiles"
+  WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true)))));
 
 
 
@@ -2885,7 +3449,7 @@ CREATE POLICY "Authenticated create grade vote" ON "public"."grade_votes" FOR IN
 
 
 
-CREATE POLICY "Authenticated create notifications" ON "public"."notifications" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
+CREATE POLICY "Authenticated create notifications" ON "public"."notifications" FOR INSERT TO "authenticated" WITH CHECK (("auth"."uid"() = "user_id"));
 
 
 
@@ -2946,6 +3510,24 @@ CREATE POLICY "Authenticated update own route grade" ON "public"."route_grades" 
 
 
 CREATE POLICY "Author soft delete comments" ON "public"."comments" FOR UPDATE USING ((("auth"."uid"() = "author_id") AND ("deleted_at" IS NULL))) WITH CHECK ((("auth"."uid"() = "author_id") AND ("deleted_at" IS NOT NULL)));
+
+
+
+CREATE POLICY "Gym members write gym route markers" ON "public"."gym_route_markers" USING ((EXISTS ( SELECT 1
+   FROM ("public"."gym_routes" "gr"
+     JOIN "public"."gym_memberships" "gm" ON (("gm"."gym_place_id" = "gr"."gym_place_id")))
+  WHERE (("gr"."id" = "gym_route_markers"."route_id") AND ("gm"."user_id" = "auth"."uid"()) AND ("gm"."status" = 'active'::"text") AND ("gm"."role" = ANY (ARRAY['owner'::"text", 'manager'::"text", 'head_setter'::"text", 'setter'::"text"])))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM ("public"."gym_routes" "gr"
+     JOIN "public"."gym_memberships" "gm" ON (("gm"."gym_place_id" = "gr"."gym_place_id")))
+  WHERE (("gr"."id" = "gym_route_markers"."route_id") AND ("gm"."user_id" = "auth"."uid"()) AND ("gm"."status" = 'active'::"text") AND ("gm"."role" = ANY (ARRAY['owner'::"text", 'manager'::"text", 'head_setter'::"text", 'setter'::"text"]))))));
+
+
+
+CREATE POLICY "Gym members write gym routes" ON "public"."gym_routes" USING ((EXISTS ( SELECT 1
+   FROM "public"."gym_memberships" "gm"
+  WHERE (("gm"."user_id" = "auth"."uid"()) AND ("gm"."gym_place_id" = "gym_routes"."gym_place_id") AND ("gm"."status" = 'active'::"text") AND ("gm"."role" = ANY (ARRAY['owner'::"text", 'manager'::"text", 'head_setter'::"text", 'setter'::"text"])))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."gym_memberships" "gm"
+  WHERE (("gm"."user_id" = "auth"."uid"()) AND ("gm"."gym_place_id" = "gym_routes"."gym_place_id") AND ("gm"."status" = 'active'::"text") AND ("gm"."role" = ANY (ARRAY['owner'::"text", 'manager'::"text", 'head_setter'::"text", 'setter'::"text"]))))));
 
 
 
@@ -3015,6 +3597,10 @@ CREATE POLICY "Owner update user_climbs" ON "public"."user_climbs" FOR UPDATE US
 
 
 
+CREATE POLICY "Public create gym owner applications" ON "public"."gym_owner_applications" FOR INSERT WITH CHECK (true);
+
+
+
 CREATE POLICY "Public read approved images" ON "public"."images" FOR SELECT USING ((COALESCE("moderation_status", 'pending'::"text") = 'approved'::"text"));
 
 
@@ -3059,11 +3645,27 @@ CREATE POLICY "Public read crags" ON "public"."crags" FOR SELECT USING (true);
 
 
 
+CREATE POLICY "Public read grade mappings" ON "public"."grade_mappings" FOR SELECT USING (true);
+
+
+
 CREATE POLICY "Public read grade votes" ON "public"."grade_votes" FOR SELECT USING (true);
 
 
 
 CREATE POLICY "Public read grades" ON "public"."grades" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "Public read gym_floor_plans" ON "public"."gym_floor_plans" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "Public read gym_route_markers" ON "public"."gym_route_markers" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "Public read gym_routes" ON "public"."gym_routes" FOR SELECT USING (true);
 
 
 
@@ -3147,6 +3749,10 @@ CREATE POLICY "Users manage own place follows" ON "public"."community_place_foll
 
 
 
+CREATE POLICY "Users read own gym memberships" ON "public"."gym_memberships" FOR SELECT USING (("auth"."uid"() = "user_id"));
+
+
+
 CREATE POLICY "Users read own place follows" ON "public"."community_place_follows" FOR SELECT USING (("auth"."uid"() = "user_id"));
 
 
@@ -3199,10 +3805,28 @@ ALTER TABLE "public"."deleted_accounts" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."deletion_requests" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."grade_mappings" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."grade_votes" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."grades" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."gym_floor_plans" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."gym_memberships" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."gym_owner_applications" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."gym_route_markers" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."gym_routes" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."images" ENABLE ROW LEVEL SECURITY;
@@ -4160,6 +4784,12 @@ GRANT ALL ON FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval
 
 
 
+GRANT ALL ON FUNCTION "public"."climbs_recompute_crag_location_trigger"() TO "anon";
+GRANT ALL ON FUNCTION "public"."climbs_recompute_crag_location_trigger"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."climbs_recompute_crag_location_trigger"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."box2df", "public"."box2df") TO "postgres";
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."box2df", "public"."box2df") TO "anon";
 GRANT ALL ON FUNCTION "public"."contains_2d"("public"."box2df", "public"."box2df") TO "authenticated";
@@ -4984,6 +5614,18 @@ GRANT ALL ON FUNCTION "public"."get_consensus_grade"("climb_id" "uuid") TO "serv
 
 
 
+GRANT ALL ON FUNCTION "public"."get_crag_pins"() TO "anon";
+GRANT ALL ON FUNCTION "public"."get_crag_pins"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_crag_pins"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_crag_pins"("include_pending" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."get_crag_pins"("include_pending" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_crag_pins"("include_pending" boolean) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."get_grade_vote_distribution"("climb_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_grade_vote_distribution"("climb_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_grade_vote_distribution"("climb_id" "uuid") TO "service_role";
@@ -5713,6 +6355,18 @@ GRANT ALL ON FUNCTION "public"."postgis_wagyu_version"() TO "postgres";
 GRANT ALL ON FUNCTION "public"."postgis_wagyu_version"() TO "anon";
 GRANT ALL ON FUNCTION "public"."postgis_wagyu_version"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."postgis_wagyu_version"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."recompute_climb_location_from_image"() TO "anon";
+GRANT ALL ON FUNCTION "public"."recompute_climb_location_from_image"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."recompute_climb_location_from_image"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."recompute_crag_counts"() TO "anon";
+GRANT ALL ON FUNCTION "public"."recompute_crag_counts"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."recompute_crag_counts"() TO "service_role";
 
 
 
@@ -8691,6 +9345,18 @@ GRANT ALL ON FUNCTION "public"."sync_profile_on_login"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."trigger_recompute_crag_counts_climbs"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trigger_recompute_crag_counts_climbs"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trigger_recompute_crag_counts_climbs"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."trigger_recompute_crag_counts_images"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trigger_recompute_crag_counts_images"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trigger_recompute_crag_counts_images"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."unlockrows"("text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."unlockrows"("text") TO "anon";
 GRANT ALL ON FUNCTION "public"."unlockrows"("text") TO "authenticated";
@@ -9021,6 +9687,12 @@ GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE "public"."deletion_requests" TO "auth
 
 
 
+GRANT ALL ON TABLE "public"."grade_mappings" TO "anon";
+GRANT ALL ON TABLE "public"."grade_mappings" TO "authenticated";
+GRANT ALL ON TABLE "public"."grade_mappings" TO "service_role";
+
+
+
 GRANT SELECT,MAINTAIN ON TABLE "public"."grade_votes" TO "anon";
 GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."grade_votes" TO "authenticated";
 GRANT ALL ON TABLE "public"."grade_votes" TO "service_role";
@@ -9030,6 +9702,36 @@ GRANT ALL ON TABLE "public"."grade_votes" TO "service_role";
 GRANT SELECT,MAINTAIN ON TABLE "public"."grades" TO "anon";
 GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."grades" TO "authenticated";
 GRANT ALL ON TABLE "public"."grades" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."gym_floor_plans" TO "anon";
+GRANT ALL ON TABLE "public"."gym_floor_plans" TO "authenticated";
+GRANT ALL ON TABLE "public"."gym_floor_plans" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."gym_memberships" TO "anon";
+GRANT ALL ON TABLE "public"."gym_memberships" TO "authenticated";
+GRANT ALL ON TABLE "public"."gym_memberships" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."gym_owner_applications" TO "anon";
+GRANT ALL ON TABLE "public"."gym_owner_applications" TO "authenticated";
+GRANT ALL ON TABLE "public"."gym_owner_applications" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."gym_route_markers" TO "anon";
+GRANT ALL ON TABLE "public"."gym_route_markers" TO "authenticated";
+GRANT ALL ON TABLE "public"."gym_route_markers" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."gym_routes" TO "anon";
+GRANT ALL ON TABLE "public"."gym_routes" TO "authenticated";
+GRANT ALL ON TABLE "public"."gym_routes" TO "service_role";
 
 
 
