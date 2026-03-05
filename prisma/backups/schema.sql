@@ -79,6 +79,85 @@ $$;
 ALTER FUNCTION "public"."add_correction_type_value"("new_value" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  current_user_id UUID := auth.uid();
+  invite_row public.submission_collaborator_invites%ROWTYPE;
+  image_owner_id UUID;
+  inserted_count INTEGER := 0;
+BEGIN
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF p_token IS NULL THEN
+    RAISE EXCEPTION 'Invite token is required';
+  END IF;
+
+  SELECT *
+  INTO invite_row
+  FROM public.submission_collaborator_invites
+  WHERE token = p_token
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Invite not found';
+  END IF;
+
+  IF invite_row.expires_at IS NOT NULL AND invite_row.expires_at <= NOW() THEN
+    RAISE EXCEPTION 'Invite has expired';
+  END IF;
+
+  IF invite_row.max_uses IS NOT NULL AND invite_row.used_count >= invite_row.max_uses THEN
+    RAISE EXCEPTION 'Invite has reached max uses';
+  END IF;
+
+  SELECT i.created_by
+  INTO image_owner_id
+  FROM public.images i
+  WHERE i.id = invite_row.image_id;
+
+  IF image_owner_id IS NULL THEN
+    RAISE EXCEPTION 'Submission owner not found';
+  END IF;
+
+  IF image_owner_id = current_user_id THEN
+    RETURN jsonb_build_object(
+      'image_id', invite_row.image_id,
+      'already_owner', true,
+      'already_collaborator', false,
+      'added', false
+    );
+  END IF;
+
+  INSERT INTO public.submission_collaborators (image_id, user_id, role, created_by)
+  VALUES (invite_row.image_id, current_user_id, 'editor', invite_row.created_by)
+  ON CONFLICT (image_id, user_id) DO NOTHING;
+
+  GET DIAGNOSTICS inserted_count = ROW_COUNT;
+
+  IF inserted_count > 0 THEN
+    UPDATE public.submission_collaborator_invites
+    SET used_count = used_count + 1
+    WHERE id = invite_row.id;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'image_id', invite_row.image_id,
+    'already_owner', false,
+    'already_collaborator', inserted_count = 0,
+    'added', inserted_count > 0
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval DEFAULT '72:00:00'::interval, "max_delete" integer DEFAULT 300) RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'auth', 'extensions'
@@ -1279,6 +1358,23 @@ $$;
 ALTER FUNCTION "public"."get_verified_routes_count"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."grade_votes_sync_climb_grade_trigger"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  target_climb_id UUID;
+BEGIN
+  target_climb_id := COALESCE(NEW.climb_id, OLD.climb_id);
+  PERFORM public.sync_climb_grade_from_votes(target_climb_id);
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."grade_votes_sync_climb_grade_trigger"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."handle_new_user"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'auth', 'extensions'
@@ -1633,6 +1729,22 @@ $$;
 
 
 ALTER FUNCTION "public"."is_profile_public"("user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_submission_collaborator"("p_image_id" "uuid", "p_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.submission_collaborators sc
+    WHERE sc.image_id = p_image_id
+      AND sc.user_id = p_user_id
+  );
+$$;
+
+
+ALTER FUNCTION "public"."is_submission_collaborator"("p_image_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") RETURNS "text"
@@ -2022,6 +2134,57 @@ $$;
 
 
 ALTER FUNCTION "public"."soft_delete_comment"("p_comment_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_climb_grade_from_votes"("p_climb_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  top_grade VARCHAR(10);
+  top_vote_count INTEGER;
+  top_grade_count INTEGER;
+BEGIN
+  IF p_climb_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT ranked.grade, ranked.vote_count
+  INTO top_grade, top_vote_count
+  FROM (
+    SELECT gv.grade, COUNT(*)::INTEGER AS vote_count
+    FROM public.grade_votes gv
+    WHERE gv.climb_id = p_climb_id
+    GROUP BY gv.grade
+    ORDER BY COUNT(*) DESC, gv.grade ASC
+    LIMIT 1
+  ) AS ranked;
+
+  IF top_grade IS NULL OR top_vote_count IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT COUNT(*)::INTEGER
+  INTO top_grade_count
+  FROM (
+    SELECT COUNT(*)::INTEGER AS vote_count
+    FROM public.grade_votes gv
+    WHERE gv.climb_id = p_climb_id
+    GROUP BY gv.grade
+  ) AS per_grade
+  WHERE per_grade.vote_count = top_vote_count;
+
+  IF top_grade_count = 1 THEN
+    UPDATE public.climbs
+    SET grade = top_grade
+    WHERE id = p_climb_id
+      AND grade IS DISTINCT FROM top_grade;
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."sync_climb_grade_from_votes"("p_climb_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."sync_crag_to_place"() RETURNS "trigger"
@@ -2594,7 +2757,7 @@ ALTER FUNCTION "public"."update_own_submission_credit"("p_image_id" "uuid", "p_p
 
 CREATE OR REPLACE FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid", "p_routes" "jsonb") RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'auth', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
 DECLARE
   current_user_id UUID := auth.uid();
@@ -2605,6 +2768,7 @@ DECLARE
   route_description TEXT;
   route_points JSONB;
   updated_count INTEGER := 0;
+  has_access BOOLEAN := false;
 BEGIN
   IF current_user_id IS NULL THEN
     RAISE EXCEPTION 'Authentication required';
@@ -2618,12 +2782,22 @@ BEGIN
     RAISE EXCEPTION 'At least one route is required';
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM public.images i
-    WHERE i.id = p_image_id
-      AND i.created_by = current_user_id
-  ) THEN
+  SELECT true
+  INTO has_access
+  FROM public.images i
+  WHERE i.id = p_image_id
+    AND (
+      i.created_by = current_user_id
+      OR EXISTS (
+        SELECT 1
+        FROM public.submission_collaborators sc
+        WHERE sc.image_id = i.id
+          AND sc.user_id = current_user_id
+      )
+    )
+  LIMIT 1;
+
+  IF COALESCE(has_access, false) = false THEN
     RAISE EXCEPTION 'You do not have permission to edit routes for this image';
   END IF;
 
@@ -2672,10 +2846,8 @@ BEGIN
     SELECT rl.climb_id
     INTO climb_id
     FROM public.route_lines rl
-    INNER JOIN public.climbs c ON c.id = rl.climb_id
     WHERE rl.id = route_id
-      AND rl.image_id = p_image_id
-      AND c.user_id = current_user_id;
+      AND rl.image_id = p_image_id;
 
     IF climb_id IS NULL THEN
       RAISE EXCEPTION 'Route not found or not editable';
@@ -2695,12 +2867,110 @@ BEGIN
     updated_count := updated_count + 1;
   END LOOP;
 
+  UPDATE public.images
+  SET last_edited_by = current_user_id
+  WHERE id = p_image_id;
+
   RETURN updated_count;
 END;
 $$;
 
 
 ALTER FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid", "p_routes" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  current_user_id UUID := auth.uid();
+  normalized_face_directions TEXT[];
+  has_access BOOLEAN := false;
+BEGIN
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF p_image_id IS NULL THEN
+    RAISE EXCEPTION 'Image ID is required';
+  END IF;
+
+  IF p_latitude IS NOT NULL AND (p_latitude < -90 OR p_latitude > 90) THEN
+    RAISE EXCEPTION 'Latitude must be between -90 and 90';
+  END IF;
+
+  IF p_longitude IS NOT NULL AND (p_longitude < -180 OR p_longitude > 180) THEN
+    RAISE EXCEPTION 'Longitude must be between -180 and 180';
+  END IF;
+
+  SELECT true
+  INTO has_access
+  FROM public.images i
+  WHERE i.id = p_image_id
+    AND (
+      i.created_by = current_user_id
+      OR EXISTS (
+        SELECT 1
+        FROM public.submission_collaborators sc
+        WHERE sc.image_id = i.id
+          AND sc.user_id = current_user_id
+      )
+    )
+  LIMIT 1;
+
+  IF COALESCE(has_access, false) = false THEN
+    RAISE EXCEPTION 'You do not have permission to edit this submission';
+  END IF;
+
+  IF p_face_directions IS NULL OR array_length(p_face_directions, 1) IS NULL THEN
+    normalized_face_directions := NULL;
+  ELSE
+    IF EXISTS (
+      SELECT 1
+      FROM unnest(p_face_directions) AS direction
+      WHERE direction IS NULL
+        OR btrim(direction) = ''
+        OR upper(btrim(direction)) NOT IN ('N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW')
+    ) THEN
+      RAISE EXCEPTION 'Invalid face direction provided';
+    END IF;
+
+    SELECT COALESCE(array_agg(direction ORDER BY min_idx), ARRAY[]::TEXT[])
+    INTO normalized_face_directions
+    FROM (
+      SELECT upper(btrim(direction)) AS direction, MIN(ord) AS min_idx
+      FROM unnest(p_face_directions) WITH ORDINALITY AS t(direction, ord)
+      GROUP BY upper(btrim(direction))
+    ) normalized;
+
+    IF array_length(normalized_face_directions, 1) IS NULL THEN
+      normalized_face_directions := NULL;
+    END IF;
+  END IF;
+
+  UPDATE public.images
+  SET
+    latitude = p_latitude,
+    longitude = p_longitude,
+    face_directions = normalized_face_directions,
+    face_direction = CASE
+      WHEN normalized_face_directions IS NULL OR array_length(normalized_face_directions, 1) IS NULL THEN NULL
+      ELSE normalized_face_directions[1]
+    END,
+    last_edited_by = current_user_id
+  WHERE id = p_image_id;
+
+  RETURN jsonb_build_object(
+    'latitude', p_latitude,
+    'longitude', p_longitude,
+    'face_directions', COALESCE(to_jsonb(normalized_face_directions), '[]'::JSONB)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."validate_comment_target"() RETURNS "trigger"
@@ -3186,6 +3456,7 @@ CREATE TABLE IF NOT EXISTS "public"."images" (
     "face_directions" "text"[],
     "contribution_credit_platform" "text",
     "contribution_credit_handle" "text",
+    "last_edited_by" "uuid",
     CONSTRAINT "images_face_direction_check" CHECK ((("face_direction" IS NULL) OR (("face_direction")::"text" = ANY ((ARRAY['N'::character varying, 'NE'::character varying, 'E'::character varying, 'SE'::character varying, 'S'::character varying, 'SW'::character varying, 'W'::character varying, 'NW'::character varying])::"text"[])))),
     CONSTRAINT "images_face_directions_check" CHECK ((("face_directions" IS NULL) OR ("face_directions" <@ ARRAY['N'::"text", 'NE'::"text", 'E'::"text", 'SE'::"text", 'S'::"text", 'SW'::"text", 'W'::"text", 'NW'::"text"]))),
     CONSTRAINT "images_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying, 'deleted'::character varying])::"text"[])))
@@ -3342,6 +3613,37 @@ CREATE TABLE IF NOT EXISTS "public"."route_lines" (
 
 
 ALTER TABLE "public"."route_lines" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."submission_collaborator_invites" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "image_id" "uuid" NOT NULL,
+    "token" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_by" "uuid",
+    "max_uses" integer,
+    "used_count" integer DEFAULT 0 NOT NULL,
+    "expires_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "submission_collaborator_invites_max_uses_check" CHECK ((("max_uses" IS NULL) OR ("max_uses" > 0))),
+    CONSTRAINT "submission_collaborator_invites_used_count_check" CHECK (("used_count" >= 0)),
+    CONSTRAINT "submission_collaborator_invites_uses_window_check" CHECK ((("max_uses" IS NULL) OR ("used_count" <= "max_uses")))
+);
+
+
+ALTER TABLE "public"."submission_collaborator_invites" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."submission_collaborators" (
+    "image_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "role" "text" DEFAULT 'editor'::"text" NOT NULL,
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "submission_collaborators_role_check" CHECK (("role" = 'editor'::"text"))
+);
+
+
+ALTER TABLE "public"."submission_collaborators" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."submission_draft_images" (
@@ -3602,6 +3904,21 @@ ALTER TABLE ONLY "public"."route_lines"
 
 ALTER TABLE ONLY "public"."route_lines"
     ADD CONSTRAINT "route_lines_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."submission_collaborator_invites"
+    ADD CONSTRAINT "submission_collaborator_invites_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."submission_collaborator_invites"
+    ADD CONSTRAINT "submission_collaborator_invites_token_key" UNIQUE ("token");
+
+
+
+ALTER TABLE ONLY "public"."submission_collaborators"
+    ADD CONSTRAINT "submission_collaborators_pkey" PRIMARY KEY ("image_id", "user_id");
 
 
 
@@ -4016,6 +4333,14 @@ CREATE INDEX "idx_route_lines_image" ON "public"."route_lines" USING "btree" ("i
 
 
 
+CREATE INDEX "idx_submission_collaborator_invites_image_id" ON "public"."submission_collaborator_invites" USING "btree" ("image_id");
+
+
+
+CREATE INDEX "idx_submission_collaborators_user_id" ON "public"."submission_collaborators" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_submission_draft_images_draft_id" ON "public"."submission_draft_images" USING "btree" ("draft_id");
 
 
@@ -4121,6 +4446,10 @@ CREATE OR REPLACE TRIGGER "places_sync_to_crags_after_write" AFTER INSERT OR DEL
 
 
 CREATE OR REPLACE TRIGGER "route_lines_set_climb_gps" AFTER INSERT OR UPDATE OF "image_id" ON "public"."route_lines" FOR EACH ROW EXECUTE FUNCTION "public"."recompute_climb_location_from_image"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_grade_votes_sync_climb_grade" AFTER INSERT OR DELETE OR UPDATE OF "grade" ON "public"."grade_votes" FOR EACH ROW EXECUTE FUNCTION "public"."grade_votes_sync_climb_grade_trigger"();
 
 
 
@@ -4355,6 +4684,11 @@ ALTER TABLE ONLY "public"."images"
 
 
 ALTER TABLE ONLY "public"."images"
+    ADD CONSTRAINT "images_last_edited_by_fkey" FOREIGN KEY ("last_edited_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."images"
     ADD CONSTRAINT "images_place_id_fkey" FOREIGN KEY ("place_id") REFERENCES "public"."places"("id") ON DELETE SET NULL;
 
 
@@ -4391,6 +4725,31 @@ ALTER TABLE ONLY "public"."route_lines"
 
 ALTER TABLE ONLY "public"."route_lines"
     ADD CONSTRAINT "route_lines_image_id_fkey" FOREIGN KEY ("image_id") REFERENCES "public"."images"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."submission_collaborator_invites"
+    ADD CONSTRAINT "submission_collaborator_invites_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."submission_collaborator_invites"
+    ADD CONSTRAINT "submission_collaborator_invites_image_id_fkey" FOREIGN KEY ("image_id") REFERENCES "public"."images"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."submission_collaborators"
+    ADD CONSTRAINT "submission_collaborators_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."submission_collaborators"
+    ADD CONSTRAINT "submission_collaborators_image_id_fkey" FOREIGN KEY ("image_id") REFERENCES "public"."images"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."submission_collaborators"
+    ADD CONSTRAINT "submission_collaborators_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -4615,6 +4974,10 @@ CREATE POLICY "Author soft delete comments" ON "public"."comments" FOR UPDATE US
 
 
 
+CREATE POLICY "Collaborators read shared images" ON "public"."images" FOR SELECT USING ("public"."is_submission_collaborator"("id", "auth"."uid"()));
+
+
+
 CREATE POLICY "Gym members write gym route markers" ON "public"."gym_route_markers" USING ((EXISTS ( SELECT 1
    FROM ("public"."gym_routes" "gr"
      JOIN "public"."gym_memberships" "gm" ON (("gm"."gym_place_id" = "gr"."gym_place_id")))
@@ -4633,6 +4996,12 @@ CREATE POLICY "Gym members write gym routes" ON "public"."gym_routes" USING ((EX
 
 
 
+CREATE POLICY "Owner add collaborators" ON "public"."submission_collaborators" FOR INSERT WITH CHECK (((EXISTS ( SELECT 1
+   FROM "public"."images" "i"
+  WHERE (("i"."id" = "submission_collaborators"."image_id") AND ("i"."created_by" = "auth"."uid"())))) AND ("created_by" = "auth"."uid"())));
+
+
+
 CREATE POLICY "Owner create climb_video_betas" ON "public"."climb_video_betas" FOR INSERT WITH CHECK (("auth"."uid"() = "user_id"));
 
 
@@ -4642,6 +5011,12 @@ CREATE POLICY "Owner create climbs" ON "public"."climbs" FOR INSERT WITH CHECK (
 
 
 CREATE POLICY "Owner create images" ON "public"."images" FOR INSERT WITH CHECK (("auth"."uid"() = "created_by"));
+
+
+
+CREATE POLICY "Owner create invites" ON "public"."submission_collaborator_invites" FOR INSERT WITH CHECK (((EXISTS ( SELECT 1
+   FROM "public"."images" "i"
+  WHERE (("i"."id" = "submission_collaborator_invites"."image_id") AND ("i"."created_by" = "auth"."uid"())))) AND ("created_by" = "auth"."uid"())));
 
 
 
@@ -4671,11 +5046,35 @@ CREATE POLICY "Owner delete user_climbs" ON "public"."user_climbs" FOR DELETE US
 
 
 
+CREATE POLICY "Owner or collaborator read collaborators" ON "public"."submission_collaborators" FOR SELECT USING ((("user_id" = "auth"."uid"()) OR (EXISTS ( SELECT 1
+   FROM "public"."images" "i"
+  WHERE (("i"."id" = "submission_collaborators"."image_id") AND ("i"."created_by" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "Owner read invites" ON "public"."submission_collaborator_invites" FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "public"."images" "i"
+  WHERE (("i"."id" = "submission_collaborator_invites"."image_id") AND ("i"."created_by" = "auth"."uid"())))));
+
+
+
 CREATE POLICY "Owner read own images" ON "public"."images" FOR SELECT USING (("auth"."uid"() = "created_by"));
 
 
 
 CREATE POLICY "Owner read own user_climbs" ON "public"."user_climbs" FOR SELECT USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Owner remove collaborators" ON "public"."submission_collaborators" FOR DELETE USING ((EXISTS ( SELECT 1
+   FROM "public"."images" "i"
+  WHERE (("i"."id" = "submission_collaborators"."image_id") AND ("i"."created_by" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "Owner revoke invites" ON "public"."submission_collaborator_invites" FOR DELETE USING ((EXISTS ( SELECT 1
+   FROM "public"."images" "i"
+  WHERE (("i"."id" = "submission_collaborator_invites"."image_id") AND ("i"."created_by" = "auth"."uid"())))));
 
 
 
@@ -4857,6 +5256,16 @@ CREATE POLICY "Users create own submission_drafts" ON "public"."submission_draft
 
 
 
+CREATE POLICY "Users delete own submission_draft_images" ON "public"."submission_draft_images" FOR DELETE USING ((EXISTS ( SELECT 1
+   FROM "public"."submission_drafts" "d"
+  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND ("d"."user_id" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "Users delete own submission_drafts" ON "public"."submission_drafts" FOR DELETE USING (("auth"."uid"() = "user_id"));
+
+
+
 CREATE POLICY "Users manage own community rsvps" ON "public"."community_post_rsvps" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
 
 
@@ -4996,6 +5405,12 @@ ALTER TABLE "public"."route_grades" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."route_lines" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."submission_collaborator_invites" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."submission_collaborators" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."submission_draft_images" ENABLE ROW LEVEL SECURITY;
@@ -5207,6 +5622,13 @@ GRANT ALL ON FUNCTION "public"."add_correction_type_value"("new_value" "text") T
 
 
 
+REVOKE ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval, "max_delete" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval, "max_delete" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval, "max_delete" integer) TO "authenticated";
@@ -5370,6 +5792,12 @@ GRANT ALL ON FUNCTION "public"."get_verified_routes_count"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."grade_votes_sync_climb_grade_trigger"() TO "anon";
+GRANT ALL ON FUNCTION "public"."grade_votes_sync_climb_grade_trigger"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."grade_votes_sync_climb_grade_trigger"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "anon";
 GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "service_role";
@@ -5444,6 +5872,13 @@ GRANT ALL ON FUNCTION "public"."is_profile_public"("user_id" "uuid") TO "service
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_submission_collaborator"("p_image_id" "uuid", "p_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_submission_collaborator"("p_image_id" "uuid", "p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_submission_collaborator"("p_image_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_submission_collaborator"("p_image_id" "uuid", "p_user_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "service_role";
@@ -5491,6 +5926,12 @@ REVOKE ALL ON FUNCTION "public"."soft_delete_comment"("p_comment_id" "uuid") FRO
 GRANT ALL ON FUNCTION "public"."soft_delete_comment"("p_comment_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."soft_delete_comment"("p_comment_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."soft_delete_comment"("p_comment_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."sync_climb_grade_from_votes"("p_climb_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."sync_climb_grade_from_votes"("p_climb_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sync_climb_grade_from_votes"("p_climb_id" "uuid") TO "service_role";
 
 
 
@@ -5572,6 +6013,13 @@ REVOKE ALL ON FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid
 GRANT ALL ON FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid", "p_routes" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid", "p_routes" "jsonb") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid", "p_routes" "jsonb") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) TO "service_role";
 
 
 
@@ -5790,6 +6238,18 @@ GRANT ALL ON TABLE "public"."route_grades" TO "service_role";
 GRANT SELECT,MAINTAIN ON TABLE "public"."route_lines" TO "anon";
 GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."route_lines" TO "authenticated";
 GRANT ALL ON TABLE "public"."route_lines" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."submission_collaborator_invites" TO "anon";
+GRANT ALL ON TABLE "public"."submission_collaborator_invites" TO "authenticated";
+GRANT ALL ON TABLE "public"."submission_collaborator_invites" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."submission_collaborators" TO "anon";
+GRANT ALL ON TABLE "public"."submission_collaborators" TO "authenticated";
+GRANT ALL ON TABLE "public"."submission_collaborators" TO "service_role";
 
 
 
