@@ -79,6 +79,145 @@ $$;
 ALTER FUNCTION "public"."add_correction_type_value"("new_value" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."append_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) RETURNS "jsonb"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  current_user_id UUID := auth.uid();
+  owner_user_id UUID;
+  current_status TEXT;
+  current_updated_at TIMESTAMPTZ;
+  next_display_order INTEGER := 0;
+  payload_count INTEGER := 0;
+  has_access BOOLEAN := false;
+  updated_at_value TIMESTAMPTZ;
+  appended_image_ids UUID[] := '{}';
+BEGIN
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF p_draft_id IS NULL THEN
+    RAISE EXCEPTION 'Draft ID is required';
+  END IF;
+
+  IF p_expected_updated_at IS NULL THEN
+    RAISE EXCEPTION 'Expected updated_at is required';
+  END IF;
+
+  IF p_images IS NULL OR jsonb_typeof(p_images) <> 'array' OR jsonb_array_length(p_images) = 0 THEN
+    RAISE EXCEPTION 'images payload must be a non-empty array';
+  END IF;
+
+  SELECT user_id, status, updated_at
+  INTO owner_user_id, current_status, current_updated_at
+  FROM public.submission_drafts
+  WHERE id = p_draft_id
+  FOR UPDATE;
+
+  IF owner_user_id IS NULL THEN
+    RAISE EXCEPTION 'Draft not found';
+  END IF;
+
+  IF current_status <> 'draft' THEN
+    RAISE EXCEPTION 'Only draft submissions can be updated';
+  END IF;
+
+  SELECT (
+    owner_user_id = current_user_id
+    OR public.is_submission_draft_collaborator(p_draft_id, current_user_id)
+  )
+  INTO has_access;
+
+  IF COALESCE(has_access, false) = false THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  IF date_trunc('milliseconds', current_updated_at) <> date_trunc('milliseconds', p_expected_updated_at) THEN
+    RAISE EXCEPTION 'Draft conflict';
+  END IF;
+
+  SELECT COALESCE(MAX(display_order), -1) + 1
+  INTO next_display_order
+  FROM public.submission_draft_images
+  WHERE draft_id = p_draft_id;
+
+  WITH payload AS (
+    SELECT
+      (item->>'storage_bucket')::TEXT AS storage_bucket,
+      (item->>'storage_path')::TEXT AS storage_path,
+      COALESCE((item->>'width')::INTEGER, NULL) AS width,
+      COALESCE((item->>'height')::INTEGER, NULL) AS height,
+      COALESCE(item->'route_data', '{}'::JSONB) AS route_data,
+      ordinality - 1 AS offset_index
+    FROM jsonb_array_elements(p_images) WITH ORDINALITY AS item(item, ordinality)
+  ),
+  inserted AS (
+    INSERT INTO public.submission_draft_images (
+      draft_id,
+      display_order,
+      storage_bucket,
+      storage_path,
+      width,
+      height,
+      route_data
+    )
+    SELECT
+      p_draft_id,
+      next_display_order + payload.offset_index,
+      payload.storage_bucket,
+      payload.storage_path,
+      payload.width,
+      payload.height,
+      payload.route_data
+    FROM payload
+    RETURNING id
+  )
+  SELECT COUNT(*), ARRAY_AGG(id)
+  INTO payload_count, appended_image_ids
+  FROM inserted;
+
+  IF payload_count = 0 THEN
+    RAISE EXCEPTION 'No images appended';
+  END IF;
+
+  UPDATE public.submission_drafts
+  SET
+    updated_at = NOW(),
+    last_edited_by = current_user_id
+  WHERE id = p_draft_id
+  RETURNING updated_at INTO updated_at_value;
+
+  RETURN jsonb_build_object(
+    'draft_id', p_draft_id,
+    'updated_at', updated_at_value,
+    'appended_image_ids', appended_image_ids,
+    'images', (
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'id', id,
+          'display_order', display_order,
+          'route_data', route_data,
+          'storage_bucket', storage_bucket,
+          'storage_path', storage_path,
+          'width', width,
+          'height', height,
+          'updated_at', updated_at
+        )
+        ORDER BY display_order
+      )
+      FROM public.submission_draft_images
+      WHERE draft_id = p_draft_id
+    )
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."append_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -156,6 +295,91 @@ $$;
 
 
 ALTER FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_submission_draft_collaborator_invite"("p_token" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  current_user_id UUID := auth.uid();
+  invite_row public.submission_draft_collaborator_invites%ROWTYPE;
+  draft_owner_id UUID;
+  draft_status TEXT;
+  inserted_count INTEGER := 0;
+BEGIN
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF p_token IS NULL THEN
+    RAISE EXCEPTION 'Invite token is required';
+  END IF;
+
+  SELECT *
+  INTO invite_row
+  FROM public.submission_draft_collaborator_invites
+  WHERE token = p_token
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Invite not found';
+  END IF;
+
+  IF invite_row.expires_at IS NOT NULL AND invite_row.expires_at <= NOW() THEN
+    RAISE EXCEPTION 'Invite has expired';
+  END IF;
+
+  IF invite_row.max_uses IS NOT NULL AND invite_row.used_count >= invite_row.max_uses THEN
+    RAISE EXCEPTION 'Invite has reached max uses';
+  END IF;
+
+  SELECT d.user_id, d.status
+  INTO draft_owner_id, draft_status
+  FROM public.submission_drafts d
+  WHERE d.id = invite_row.draft_id
+  FOR UPDATE;
+
+  IF draft_owner_id IS NULL THEN
+    RAISE EXCEPTION 'Draft owner not found';
+  END IF;
+
+  IF draft_status <> 'draft' THEN
+    RAISE EXCEPTION 'Invite is no longer valid';
+  END IF;
+
+  IF draft_owner_id = current_user_id THEN
+    RETURN jsonb_build_object(
+      'draft_id', invite_row.draft_id,
+      'already_owner', true,
+      'already_collaborator', false,
+      'added', false
+    );
+  END IF;
+
+  INSERT INTO public.submission_draft_collaborators (draft_id, user_id, role, created_by)
+  VALUES (invite_row.draft_id, current_user_id, 'editor', invite_row.created_by)
+  ON CONFLICT (draft_id, user_id) DO NOTHING;
+
+  GET DIAGNOSTICS inserted_count = ROW_COUNT;
+
+  IF inserted_count > 0 THEN
+    UPDATE public.submission_draft_collaborator_invites
+    SET used_count = used_count + 1
+    WHERE id = invite_row.id;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'draft_id', invite_row.draft_id,
+    'already_owner', false,
+    'already_collaborator', inserted_count = 0,
+    'added', inserted_count > 0
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_submission_draft_collaborator_invite"("p_token" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."cleanup_orphan_route_uploads"("max_age" interval DEFAULT '72:00:00'::interval, "max_delete" integer DEFAULT 300) RETURNS integer
@@ -1405,6 +1629,63 @@ $$;
 ALTER FUNCTION "public"."handle_new_user"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."handle_submission_draft_promoted"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  draft_latitude DOUBLE PRECISION;
+  draft_longitude DOUBLE PRECISION;
+BEGIN
+  IF NEW.status = 'submitted' AND OLD.status = 'draft' THEN
+    IF jsonb_typeof(COALESCE(NEW.metadata->'location'->'latitude', 'null'::jsonb)) = 'number' THEN
+      draft_latitude := (NEW.metadata->'location'->>'latitude')::DOUBLE PRECISION;
+    END IF;
+
+    IF jsonb_typeof(COALESCE(NEW.metadata->'location'->'longitude', 'null'::jsonb)) = 'number' THEN
+      draft_longitude := (NEW.metadata->'location'->>'longitude')::DOUBLE PRECISION;
+    END IF;
+
+    IF draft_latitude IS NULL OR draft_longitude IS NULL
+      OR draft_latitude < -90 OR draft_latitude > 90
+      OR draft_longitude < -180 OR draft_longitude > 180 THEN
+      RAISE EXCEPTION 'Draft location is required before publishing';
+    END IF;
+
+    UPDATE public.images i
+    SET
+      latitude = draft_latitude,
+      longitude = draft_longitude
+    FROM public.submission_draft_images di
+    WHERE di.draft_id = NEW.id
+      AND di.linked_image_id IS NOT NULL
+      AND i.id = di.linked_image_id;
+
+    INSERT INTO public.submission_collaborators (image_id, user_id, role, created_by)
+    SELECT
+      di.linked_image_id,
+      c.user_id,
+      c.role,
+      COALESCE(c.created_by, NEW.user_id)
+    FROM public.submission_draft_collaborators c
+    CROSS JOIN public.submission_draft_images di
+    WHERE c.draft_id = NEW.id
+      AND di.draft_id = NEW.id
+      AND di.linked_image_id IS NOT NULL
+    ON CONFLICT (image_id, user_id) DO NOTHING;
+
+    DELETE FROM public.submission_draft_collaborator_invites
+    WHERE draft_id = NEW.id;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."handle_submission_draft_promoted"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."handle_user_metadata_update"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'auth', 'extensions'
@@ -1747,6 +2028,22 @@ $$;
 ALTER FUNCTION "public"."is_submission_collaborator"("p_image_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_submission_draft_collaborator"("p_draft_id" "uuid", "p_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.submission_draft_collaborators sdc
+    WHERE sdc.draft_id = p_draft_id
+      AND sdc.user_id = p_user_id
+  );
+$$;
+
+
+ALTER FUNCTION "public"."is_submission_draft_collaborator"("p_draft_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") RETURNS "text"
     LANGUAGE "plpgsql" IMMUTABLE
     SET "search_path" TO 'public', 'auth', 'extensions'
@@ -1923,6 +2220,591 @@ $$;
 
 
 ALTER FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) RETURNS "jsonb"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  current_user_id UUID := auth.uid();
+  owner_user_id UUID;
+  payload_count INTEGER;
+  distinct_id_count INTEGER;
+  distinct_order_count INTEGER;
+  draft_image_count INTEGER;
+  updated_count INTEGER;
+  updated_at_value TIMESTAMPTZ;
+  current_updated_at TIMESTAMPTZ;
+  has_access BOOLEAN := false;
+BEGIN
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF p_draft_id IS NULL THEN
+    RAISE EXCEPTION 'Draft ID is required';
+  END IF;
+
+  IF p_expected_updated_at IS NULL THEN
+    RAISE EXCEPTION 'Expected updated_at is required';
+  END IF;
+
+  IF p_images IS NULL OR jsonb_typeof(p_images) <> 'array' OR jsonb_array_length(p_images) = 0 THEN
+    RAISE EXCEPTION 'images payload must be a non-empty array';
+  END IF;
+
+  SELECT user_id, updated_at
+  INTO owner_user_id, current_updated_at
+  FROM public.submission_drafts
+  WHERE id = p_draft_id
+  FOR UPDATE;
+
+  IF owner_user_id IS NULL THEN
+    RAISE EXCEPTION 'Draft not found';
+  END IF;
+
+  SELECT (
+    owner_user_id = current_user_id
+    OR public.is_submission_draft_collaborator(p_draft_id, current_user_id)
+  )
+  INTO has_access;
+
+  IF COALESCE(has_access, false) = false THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  IF date_trunc('milliseconds', current_updated_at) <> date_trunc('milliseconds', p_expected_updated_at) THEN
+    RAISE EXCEPTION 'Draft conflict';
+  END IF;
+
+  WITH payload AS (
+    SELECT
+      (item->>'id')::UUID AS id,
+      (item->>'display_order')::INTEGER AS display_order,
+      COALESCE(item->'route_data', '{}'::JSONB) AS route_data
+    FROM jsonb_array_elements(p_images) AS item
+  )
+  SELECT
+    COUNT(*),
+    COUNT(DISTINCT id),
+    COUNT(DISTINCT display_order)
+  INTO payload_count, distinct_id_count, distinct_order_count
+  FROM payload;
+
+  IF payload_count <> distinct_id_count THEN
+    RAISE EXCEPTION 'Duplicate image IDs in payload';
+  END IF;
+
+  IF payload_count <> distinct_order_count THEN
+    RAISE EXCEPTION 'Duplicate display_order values in payload';
+  END IF;
+
+  SELECT COUNT(*) INTO draft_image_count
+  FROM public.submission_draft_images
+  WHERE draft_id = p_draft_id;
+
+  IF draft_image_count <> payload_count THEN
+    RAISE EXCEPTION 'Payload must include all draft images';
+  END IF;
+
+  IF EXISTS (
+    WITH payload AS (
+      SELECT (item->>'id')::UUID AS id
+      FROM jsonb_array_elements(p_images) AS item
+    )
+    SELECT 1
+    FROM payload p
+    LEFT JOIN public.submission_draft_images di
+      ON di.id = p.id AND di.draft_id = p_draft_id
+    WHERE di.id IS NULL
+  ) THEN
+    RAISE EXCEPTION 'One or more images do not belong to this draft';
+  END IF;
+
+  WITH ordered AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY display_order, id) AS rn
+    FROM public.submission_draft_images
+    WHERE draft_id = p_draft_id
+  )
+  UPDATE public.submission_draft_images di
+  SET display_order = 1000000 + ordered.rn
+  FROM ordered
+  WHERE di.id = ordered.id;
+
+  WITH payload AS (
+    SELECT
+      (item->>'id')::UUID AS id,
+      (item->>'display_order')::INTEGER AS display_order,
+      COALESCE(item->'route_data', '{}'::JSONB) AS route_data
+    FROM jsonb_array_elements(p_images) AS item
+  )
+  UPDATE public.submission_draft_images di
+  SET
+    display_order = p.display_order,
+    route_data = p.route_data,
+    updated_at = NOW()
+  FROM payload p
+  WHERE di.id = p.id
+    AND di.draft_id = p_draft_id;
+
+  GET DIAGNOSTICS updated_count = ROW_COUNT;
+
+  UPDATE public.submission_drafts
+  SET
+    updated_at = NOW(),
+    last_edited_by = current_user_id
+  WHERE id = p_draft_id
+  RETURNING updated_at INTO updated_at_value;
+
+  RETURN jsonb_build_object(
+    'draft_id', p_draft_id,
+    'updated_at', updated_at_value,
+    'updated_count', updated_count,
+    'images', (
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'id', id,
+          'display_order', display_order,
+          'route_data', route_data,
+          'updated_at', updated_at
+        )
+        ORDER BY display_order
+      )
+      FROM public.submission_draft_images
+      WHERE draft_id = p_draft_id
+    )
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."promote_draft_to_submission"("p_draft_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  current_user_id UUID := auth.uid();
+  draft_row public.submission_drafts%ROWTYPE;
+  primary_index INTEGER;
+  primary_draft_image_id UUID;
+  primary_live_image_id UUID;
+  current_live_image_id UUID;
+  current_crag_image_id UUID;
+  published_image_id UUID;
+  published_at TEXT;
+  climb_ids_json JSONB;
+  route_line_ids_json JSONB;
+  image_ids_json JSONB;
+  all_live_image_ids UUID[] := ARRAY[]::UUID[];
+  all_climb_ids UUID[] := ARRAY[]::UUID[];
+  all_route_line_ids UUID[] := ARRAY[]::UUID[];
+  image_id_map JSONB := '{}'::JSONB;
+  route_type_default TEXT;
+  route_type_raw TEXT;
+  route_type_normalized TEXT;
+  image_row RECORD;
+  route_item JSONB;
+  route_index INTEGER;
+  route_name TEXT;
+  route_grade TEXT;
+  route_description TEXT;
+  route_slug TEXT;
+  route_points JSONB;
+  route_sequence_order INTEGER;
+  route_image_width INTEGER;
+  route_image_height INTEGER;
+  created_climb_id UUID;
+  created_route_line_id UUID;
+  face_directions_by_image JSONB;
+  legacy_face_directions JSONB;
+  face_directions_json JSONB;
+  face_directions_text TEXT[];
+BEGIN
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF p_draft_id IS NULL THEN
+    RAISE EXCEPTION 'Draft ID is required';
+  END IF;
+
+  SELECT *
+  INTO draft_row
+  FROM public.submission_drafts
+  WHERE id = p_draft_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Draft not found';
+  END IF;
+
+  IF draft_row.user_id <> current_user_id THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  IF draft_row.status = 'submitted' THEN
+    published_image_id := NULLIF(COALESCE(draft_row.metadata->>'publishedImageId', draft_row.metadata->>'image_id', ''), '')::UUID;
+    published_at := NULLIF(COALESCE(draft_row.metadata->>'publishedAt', draft_row.metadata->>'submittedAt', ''), '');
+    image_ids_json := COALESCE(draft_row.metadata->'allPublishedImageIds', '[]'::JSONB);
+    climb_ids_json := COALESCE(draft_row.metadata->'publishedClimbIds', draft_row.metadata->'climb_ids', '[]'::JSONB);
+    route_line_ids_json := COALESCE(draft_row.metadata->'publishedRouteLineIds', draft_row.metadata->'route_line_ids', '[]'::JSONB);
+
+    IF published_image_id IS NULL THEN
+      SELECT di.linked_image_id
+      INTO published_image_id
+      FROM public.submission_draft_images di
+      WHERE di.draft_id = draft_row.id
+      ORDER BY di.display_order
+      LIMIT 1;
+    END IF;
+
+    IF published_image_id IS NULL THEN
+      RAISE EXCEPTION 'Draft was submitted but publish metadata is missing';
+    END IF;
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'status', 'already_submitted',
+      'draft_id', draft_row.id,
+      'image_id', published_image_id,
+      'image_ids', COALESCE(image_ids_json, '[]'::JSONB),
+      'climb_ids', COALESCE(climb_ids_json, '[]'::JSONB),
+      'route_line_ids', COALESCE(route_line_ids_json, '[]'::JSONB),
+      'published_at', published_at
+    );
+  END IF;
+
+  IF draft_row.status <> 'draft' THEN
+    RAISE EXCEPTION 'Only draft submissions can be promoted';
+  END IF;
+
+  IF draft_row.crag_id IS NULL THEN
+    RAISE EXCEPTION 'Draft must have a crag before publishing';
+  END IF;
+
+  SELECT COUNT(*) INTO route_index
+  FROM public.submission_draft_images
+  WHERE draft_id = draft_row.id;
+
+  IF route_index = 0 THEN
+    RAISE EXCEPTION 'Draft has no images to publish';
+  END IF;
+
+  primary_index := COALESCE((draft_row.metadata->>'primaryIndex')::INTEGER, 0);
+  IF primary_index < 0 OR primary_index >= route_index THEN
+    primary_index := 0;
+  END IF;
+
+  SELECT di.id
+  INTO primary_draft_image_id
+  FROM public.submission_draft_images di
+  WHERE di.draft_id = draft_row.id
+  ORDER BY di.display_order
+  OFFSET primary_index
+  LIMIT 1;
+
+  IF primary_draft_image_id IS NULL THEN
+    RAISE EXCEPTION 'Primary draft image is missing';
+  END IF;
+
+  face_directions_by_image := COALESCE(draft_row.metadata->'faceDirectionsByImage', '{}'::JSONB);
+  legacy_face_directions := COALESCE(draft_row.metadata->'faceDirections', '[]'::JSONB);
+  route_type_default := NULLIF(btrim(COALESCE(draft_row.metadata->>'routeType', '')), '');
+  IF route_type_default IS NULL THEN
+    route_type_default := 'sport';
+  END IF;
+
+  SELECT di.*
+  INTO image_row
+  FROM public.submission_draft_images di
+  WHERE di.id = primary_draft_image_id
+    AND di.draft_id = draft_row.id;
+
+  IF jsonb_typeof(face_directions_by_image) = 'object'
+    AND jsonb_typeof(COALESCE(face_directions_by_image->(image_row.display_order::TEXT), 'null'::JSONB)) = 'array' THEN
+    face_directions_json := face_directions_by_image->(image_row.display_order::TEXT);
+  ELSE
+    face_directions_json := legacy_face_directions;
+  END IF;
+
+  IF jsonb_typeof(face_directions_json) <> 'array' OR jsonb_array_length(face_directions_json) = 0 THEN
+    RAISE EXCEPTION 'Primary face directions are required before publishing';
+  END IF;
+
+  face_directions_text := ARRAY(
+    SELECT jsonb_array_elements_text(face_directions_json)
+  );
+
+  INSERT INTO public.images (
+    url,
+    storage_bucket,
+    storage_path,
+    crag_id,
+    width,
+    height,
+    natural_width,
+    natural_height,
+    face_direction,
+    face_directions,
+    created_by,
+    parent_image_id,
+    is_primary
+  )
+  VALUES (
+    format('private://%s/%s', image_row.storage_bucket, image_row.storage_path),
+    image_row.storage_bucket,
+    image_row.storage_path,
+    draft_row.crag_id,
+    image_row.width,
+    image_row.height,
+    image_row.width,
+    image_row.height,
+    CASE WHEN array_length(face_directions_text, 1) IS NULL THEN NULL ELSE face_directions_text[1] END,
+    face_directions_text,
+    current_user_id,
+    NULL,
+    TRUE
+  )
+  RETURNING id INTO primary_live_image_id;
+
+  all_live_image_ids := array_append(all_live_image_ids, primary_live_image_id);
+  image_id_map := image_id_map || jsonb_build_object(primary_draft_image_id::TEXT, primary_live_image_id::TEXT);
+
+  UPDATE public.submission_draft_images
+  SET
+    linked_image_id = primary_live_image_id,
+    linked_crag_image_id = NULL,
+    submitted_at = NOW(),
+    updated_at = NOW()
+  WHERE id = primary_draft_image_id;
+
+  FOR image_row IN
+    SELECT *
+    FROM public.submission_draft_images di
+    WHERE di.draft_id = draft_row.id
+      AND di.id <> primary_draft_image_id
+    ORDER BY di.display_order
+  LOOP
+    IF jsonb_typeof(face_directions_by_image) = 'object'
+      AND jsonb_typeof(COALESCE(face_directions_by_image->(image_row.display_order::TEXT), 'null'::JSONB)) = 'array' THEN
+      face_directions_json := face_directions_by_image->(image_row.display_order::TEXT);
+    ELSE
+      face_directions_json := '[]'::JSONB;
+    END IF;
+
+    face_directions_text := ARRAY(
+      SELECT jsonb_array_elements_text(COALESCE(face_directions_json, '[]'::JSONB))
+    );
+
+    INSERT INTO public.images (
+      url,
+      storage_bucket,
+      storage_path,
+      crag_id,
+      width,
+      height,
+      natural_width,
+      natural_height,
+      face_direction,
+      face_directions,
+      created_by,
+      parent_image_id,
+      is_primary
+    )
+    VALUES (
+      format('private://%s/%s', image_row.storage_bucket, image_row.storage_path),
+      image_row.storage_bucket,
+      image_row.storage_path,
+      draft_row.crag_id,
+      image_row.width,
+      image_row.height,
+      image_row.width,
+      image_row.height,
+      CASE WHEN array_length(face_directions_text, 1) IS NULL THEN NULL ELSE face_directions_text[1] END,
+      face_directions_text,
+      current_user_id,
+      primary_live_image_id,
+      FALSE
+    )
+    RETURNING id INTO current_live_image_id;
+
+    INSERT INTO public.crag_images (
+      crag_id,
+      url,
+      width,
+      height,
+      source_image_id,
+      linked_image_id,
+      face_directions
+    )
+    VALUES (
+      draft_row.crag_id,
+      format('private://%s/%s', image_row.storage_bucket, image_row.storage_path),
+      image_row.width,
+      image_row.height,
+      primary_live_image_id,
+      current_live_image_id,
+      face_directions_text
+    )
+    RETURNING id INTO current_crag_image_id;
+
+    all_live_image_ids := array_append(all_live_image_ids, current_live_image_id);
+    image_id_map := image_id_map || jsonb_build_object(image_row.id::TEXT, current_live_image_id::TEXT);
+
+    UPDATE public.submission_draft_images
+    SET
+      linked_image_id = current_live_image_id,
+      linked_crag_image_id = current_crag_image_id,
+      submitted_at = NOW(),
+      updated_at = NOW()
+    WHERE id = image_row.id;
+  END LOOP;
+
+  FOR image_row IN
+    SELECT *
+    FROM public.submission_draft_images di
+    WHERE di.draft_id = draft_row.id
+    ORDER BY di.display_order
+  LOOP
+    current_live_image_id := NULLIF(COALESCE(image_id_map->>image_row.id::TEXT, ''), '')::UUID;
+    IF current_live_image_id IS NULL THEN
+      RAISE EXCEPTION 'Missing image mapping for draft image %', image_row.id;
+    END IF;
+
+    route_index := 0;
+    FOR route_item IN
+      SELECT value
+      FROM jsonb_array_elements(COALESCE(image_row.route_data->'completedRoutes', '[]'::JSONB))
+    LOOP
+      route_name := btrim(COALESCE(route_item->>'name', ''));
+      route_grade := btrim(COALESCE(route_item->>'grade', ''));
+      route_description := NULLIF(btrim(COALESCE(route_item->>'description', '')), '');
+      route_slug := NULLIF(btrim(COALESCE(route_item->>'slug', '')), '');
+      route_points := route_item->'points';
+
+      IF route_name = '' OR route_grade = '' THEN
+        route_index := route_index + 1;
+        CONTINUE;
+      END IF;
+
+      IF route_points IS NULL OR jsonb_typeof(route_points) <> 'array' OR jsonb_array_length(route_points) < 2 THEN
+        route_index := route_index + 1;
+        CONTINUE;
+      END IF;
+
+      BEGIN
+        route_sequence_order := COALESCE((route_item->>'sequenceOrder')::INTEGER, route_index);
+      EXCEPTION WHEN OTHERS THEN
+        route_sequence_order := route_index;
+      END;
+
+      BEGIN
+        route_image_width := COALESCE((route_item->>'imageWidth')::INTEGER, image_row.width, 1200);
+      EXCEPTION WHEN OTHERS THEN
+        route_image_width := COALESCE(image_row.width, 1200);
+      END;
+
+      BEGIN
+        route_image_height := COALESCE((route_item->>'imageHeight')::INTEGER, image_row.height, 1200);
+      EXCEPTION WHEN OTHERS THEN
+        route_image_height := COALESCE(image_row.height, 1200);
+      END;
+
+      route_type_raw := NULLIF(btrim(COALESCE(route_item->>'climbType', route_type_default)), '');
+      route_type_normalized := replace(lower(COALESCE(route_type_raw, route_type_default)), '_', '-');
+      IF route_type_normalized = 'bouldering' THEN
+        route_type_normalized := 'boulder';
+      END IF;
+      IF route_type_normalized NOT IN ('sport', 'boulder', 'trad', 'deep-water-solo') THEN
+        route_type_normalized := 'sport';
+      END IF;
+
+      INSERT INTO public.climbs (
+        name,
+        slug,
+        grade,
+        description,
+        route_type,
+        status,
+        user_id,
+        crag_id
+      )
+      VALUES (
+        route_name,
+        route_slug,
+        route_grade,
+        route_description,
+        route_type_normalized,
+        'approved',
+        current_user_id,
+        draft_row.crag_id
+      )
+      RETURNING id INTO created_climb_id;
+
+      INSERT INTO public.route_lines (
+        image_id,
+        climb_id,
+        points,
+        color,
+        sequence_order,
+        image_width,
+        image_height
+      )
+      VALUES (
+        current_live_image_id,
+        created_climb_id,
+        route_points,
+        'red',
+        route_sequence_order,
+        route_image_width,
+        route_image_height
+      )
+      RETURNING id INTO created_route_line_id;
+
+      all_climb_ids := array_append(all_climb_ids, created_climb_id);
+      all_route_line_ids := array_append(all_route_line_ids, created_route_line_id);
+
+      route_index := route_index + 1;
+    END LOOP;
+  END LOOP;
+
+  IF COALESCE(array_length(all_route_line_ids, 1), 0) = 0 THEN
+    RAISE EXCEPTION 'Draft must contain at least one valid route before publishing';
+  END IF;
+
+  UPDATE public.submission_drafts
+  SET
+    status = 'submitted',
+    metadata = COALESCE(metadata, '{}'::JSONB) || jsonb_build_object(
+      'publishedImageId', primary_live_image_id,
+      'allPublishedImageIds', to_jsonb(all_live_image_ids),
+      'publishedClimbIds', to_jsonb(all_climb_ids),
+      'publishedRouteLineIds', to_jsonb(all_route_line_ids),
+      'publishedAt', NOW(),
+      'publishMode', 'v2-multiface'
+    ),
+    updated_at = NOW()
+  WHERE id = draft_row.id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'status', 'submitted',
+    'draft_id', draft_row.id,
+    'image_id', primary_live_image_id,
+    'image_ids', to_jsonb(all_live_image_ids),
+    'climb_ids', to_jsonb(all_climb_ids),
+    'route_line_ids', to_jsonb(all_route_line_ids),
+    'published_at', NOW()
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."promote_draft_to_submission"("p_draft_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."recompute_climb_location_from_image"() RETURNS "trigger"
@@ -2879,6 +3761,134 @@ $$;
 ALTER FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid", "p_routes" "jsonb") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."update_submission_crag_metadata"("p_image_id" "uuid", "p_crag_name" "text", "p_region_tag" "text", "p_sub_area" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  current_user_id UUID := auth.uid();
+  v_image RECORD;
+  v_crag RECORD;
+  v_country_code TEXT;
+  v_region_tag TEXT;
+  v_sub_area TEXT;
+  v_tag_id UUID;
+  v_slug TEXT;
+BEGIN
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF p_image_id IS NULL THEN
+    RAISE EXCEPTION 'Image ID is required';
+  END IF;
+
+  IF p_crag_name IS NULL OR btrim(p_crag_name) = '' THEN
+    RAISE EXCEPTION 'Crag name is required';
+  END IF;
+
+  IF p_region_tag IS NULL OR btrim(p_region_tag) = '' THEN
+    RAISE EXCEPTION 'Region tag is required';
+  END IF;
+
+  v_region_tag := btrim(p_region_tag);
+  v_sub_area := NULLIF(btrim(COALESCE(p_sub_area, '')), '');
+
+  SELECT id, created_by, crag_id
+  INTO v_image
+  FROM public.images
+  WHERE id = p_image_id
+  LIMIT 1;
+
+  IF v_image IS NULL THEN
+    RAISE EXCEPTION 'Image not found';
+  END IF;
+
+  IF v_image.created_by IS NULL OR v_image.created_by <> current_user_id THEN
+    RAISE EXCEPTION 'Only the submission owner can edit crag metadata';
+  END IF;
+
+  IF v_image.crag_id IS NULL THEN
+    RAISE EXCEPTION 'Submission image is not linked to a crag';
+  END IF;
+
+  SELECT id, country_code
+  INTO v_crag
+  FROM public.crags
+  WHERE id = v_image.crag_id
+  LIMIT 1;
+
+  IF v_crag IS NULL THEN
+    RAISE EXCEPTION 'Crag not found';
+  END IF;
+
+  v_country_code := NULLIF(upper(btrim(COALESCE(v_crag.country_code, ''))), '');
+  v_slug := trim(both '-' from regexp_replace(lower(v_region_tag), '[^a-z0-9]+', '-', 'g'));
+
+  IF v_slug = '' THEN
+    v_slug := 'region';
+  END IF;
+
+  SELECT id
+  INTO v_tag_id
+  FROM public.location_tags
+  WHERE kind = 'region'
+    AND lower(name) = lower(v_region_tag)
+    AND COALESCE(country_code, '') = COALESCE(v_country_code, '')
+  LIMIT 1;
+
+  IF v_tag_id IS NULL THEN
+    BEGIN
+      INSERT INTO public.location_tags (kind, name, slug, country_code)
+      VALUES ('region', v_region_tag, v_slug, v_country_code)
+      RETURNING id INTO v_tag_id;
+    EXCEPTION WHEN unique_violation THEN
+      SELECT id
+      INTO v_tag_id
+      FROM public.location_tags
+      WHERE kind = 'region'
+        AND lower(name) = lower(v_region_tag)
+        AND COALESCE(country_code, '') = COALESCE(v_country_code, '')
+      LIMIT 1;
+    END;
+  END IF;
+
+  IF v_tag_id IS NULL THEN
+    RAISE EXCEPTION 'Failed to resolve region tag';
+  END IF;
+
+  UPDATE public.crags
+  SET
+    name = btrim(p_crag_name),
+    region_name = v_region_tag,
+    sub_area = v_sub_area,
+    updated_at = now(),
+    last_edited_by = current_user_id
+  WHERE id = v_crag.id;
+
+  DELETE FROM public.crag_location_tags
+  WHERE crag_id = v_crag.id
+    AND is_primary_region = true;
+
+  INSERT INTO public.crag_location_tags (crag_id, tag_id, is_primary_region)
+  VALUES (v_crag.id, v_tag_id, true)
+  ON CONFLICT (crag_id, tag_id)
+  DO UPDATE SET is_primary_region = true;
+
+  RETURN jsonb_build_object(
+    'crag_id', v_crag.id,
+    'name', btrim(p_crag_name),
+    'region_tag', v_region_tag,
+    'sub_area', v_sub_area,
+    'last_edited_by', current_user_id
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_submission_crag_metadata"("p_image_id" "uuid", "p_crag_name" "text", "p_region_tag" "text", "p_sub_area" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -3219,6 +4229,17 @@ CREATE TABLE IF NOT EXISTS "public"."correction_votes" (
 ALTER TABLE "public"."correction_votes" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."crag_location_tags" (
+    "crag_id" "uuid" NOT NULL,
+    "tag_id" "uuid" NOT NULL,
+    "is_primary_region" boolean DEFAULT false NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."crag_location_tags" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."crag_reports" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "crag_id" "uuid" NOT NULL,
@@ -3257,7 +4278,9 @@ CREATE TABLE IF NOT EXISTS "public"."crags" (
     "country_code" character varying(2),
     "slug" "text",
     "image_count" integer DEFAULT 0,
-    "route_count" integer DEFAULT 0
+    "route_count" integer DEFAULT 0,
+    "sub_area" character varying(120),
+    "last_edited_by" "uuid"
 );
 
 
@@ -3457,6 +4480,8 @@ CREATE TABLE IF NOT EXISTS "public"."images" (
     "contribution_credit_platform" "text",
     "contribution_credit_handle" "text",
     "last_edited_by" "uuid",
+    "parent_image_id" "uuid",
+    "is_primary" boolean DEFAULT true NOT NULL,
     CONSTRAINT "images_face_direction_check" CHECK ((("face_direction" IS NULL) OR (("face_direction")::"text" = ANY ((ARRAY['N'::character varying, 'NE'::character varying, 'E'::character varying, 'SE'::character varying, 'S'::character varying, 'SW'::character varying, 'W'::character varying, 'NW'::character varying])::"text"[])))),
     CONSTRAINT "images_face_directions_check" CHECK ((("face_directions" IS NULL) OR ("face_directions" <@ ARRAY['N'::"text", 'NE'::"text", 'E'::"text", 'SE'::"text", 'S'::"text", 'SW'::"text", 'W'::"text", 'NW'::"text"]))),
     CONSTRAINT "images_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying, 'deleted'::character varying])::"text"[])))
@@ -3464,6 +4489,21 @@ CREATE TABLE IF NOT EXISTS "public"."images" (
 
 
 ALTER TABLE "public"."images" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."location_tags" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "kind" "text" NOT NULL,
+    "name" character varying(120) NOT NULL,
+    "slug" "text" NOT NULL,
+    "country_code" character varying(2),
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "location_tags_kind_check" CHECK (("kind" = ANY (ARRAY['region'::"text", 'sub_area'::"text"])))
+);
+
+
+ALTER TABLE "public"."location_tags" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."notifications" (
@@ -3646,6 +4686,37 @@ CREATE TABLE IF NOT EXISTS "public"."submission_collaborators" (
 ALTER TABLE "public"."submission_collaborators" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."submission_draft_collaborator_invites" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "draft_id" "uuid" NOT NULL,
+    "token" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_by" "uuid",
+    "max_uses" integer,
+    "used_count" integer DEFAULT 0 NOT NULL,
+    "expires_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "submission_draft_collaborator_invites_max_uses_check" CHECK ((("max_uses" IS NULL) OR ("max_uses" > 0))),
+    CONSTRAINT "submission_draft_collaborator_invites_used_count_check" CHECK (("used_count" >= 0)),
+    CONSTRAINT "submission_draft_collaborator_invites_uses_window_check" CHECK ((("max_uses" IS NULL) OR ("used_count" <= "max_uses")))
+);
+
+
+ALTER TABLE "public"."submission_draft_collaborator_invites" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."submission_draft_collaborators" (
+    "draft_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "role" "text" DEFAULT 'editor'::"text" NOT NULL,
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "submission_draft_collaborators_role_check" CHECK (("role" = 'editor'::"text"))
+);
+
+
+ALTER TABLE "public"."submission_draft_collaborators" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."submission_draft_images" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "draft_id" "uuid" NOT NULL,
@@ -3659,6 +4730,7 @@ CREATE TABLE IF NOT EXISTS "public"."submission_draft_images" (
     "linked_crag_image_id" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "submitted_at" timestamp with time zone,
     CONSTRAINT "submission_draft_images_display_order_check" CHECK (("display_order" >= 0)),
     CONSTRAINT "submission_draft_images_storage_bucket_check" CHECK (("char_length"(TRIM(BOTH FROM "storage_bucket")) > 0)),
     CONSTRAINT "submission_draft_images_storage_path_check" CHECK (("char_length"(TRIM(BOTH FROM "storage_path")) > 0))
@@ -3676,6 +4748,7 @@ CREATE TABLE IF NOT EXISTS "public"."submission_drafts" (
     "metadata" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_edited_by" "uuid",
     CONSTRAINT "submission_drafts_status_check" CHECK (("status" = ANY (ARRAY['draft'::"text", 'submitted'::"text"])))
 );
 
@@ -3782,6 +4855,11 @@ ALTER TABLE ONLY "public"."crag_images"
 
 
 
+ALTER TABLE ONLY "public"."crag_location_tags"
+    ADD CONSTRAINT "crag_location_tags_pkey" PRIMARY KEY ("crag_id", "tag_id");
+
+
+
 ALTER TABLE ONLY "public"."crag_reports"
     ADD CONSTRAINT "crag_reports_pkey" PRIMARY KEY ("id");
 
@@ -3857,6 +4935,11 @@ ALTER TABLE ONLY "public"."images"
 
 
 
+ALTER TABLE ONLY "public"."location_tags"
+    ADD CONSTRAINT "location_tags_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."notifications"
     ADD CONSTRAINT "notifications_pkey" PRIMARY KEY ("id");
 
@@ -3919,6 +5002,21 @@ ALTER TABLE ONLY "public"."submission_collaborator_invites"
 
 ALTER TABLE ONLY "public"."submission_collaborators"
     ADD CONSTRAINT "submission_collaborators_pkey" PRIMARY KEY ("image_id", "user_id");
+
+
+
+ALTER TABLE ONLY "public"."submission_draft_collaborator_invites"
+    ADD CONSTRAINT "submission_draft_collaborator_invites_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."submission_draft_collaborator_invites"
+    ADD CONSTRAINT "submission_draft_collaborator_invites_token_key" UNIQUE ("token");
+
+
+
+ALTER TABLE ONLY "public"."submission_draft_collaborators"
+    ADD CONSTRAINT "submission_draft_collaborators_pkey" PRIMARY KEY ("draft_id", "user_id");
 
 
 
@@ -4097,6 +5195,14 @@ CREATE INDEX "idx_crag_images_source_image_id" ON "public"."crag_images" USING "
 
 
 
+CREATE INDEX "idx_crag_location_tags_crag_id" ON "public"."crag_location_tags" USING "btree" ("crag_id");
+
+
+
+CREATE INDEX "idx_crag_location_tags_tag_id" ON "public"."crag_location_tags" USING "btree" ("tag_id");
+
+
+
 CREATE INDEX "idx_crag_reports_crag" ON "public"."crag_reports" USING "btree" ("crag_id");
 
 
@@ -4225,11 +5331,19 @@ CREATE INDEX "idx_images_created_by" ON "public"."images" USING "btree" ("create
 
 
 
+CREATE INDEX "idx_images_is_primary" ON "public"."images" USING "btree" ("is_primary");
+
+
+
 CREATE INDEX "idx_images_location" ON "public"."images" USING "btree" ("latitude", "longitude");
 
 
 
 CREATE INDEX "idx_images_moderation_status" ON "public"."images" USING "btree" ("moderation_status");
+
+
+
+CREATE INDEX "idx_images_parent_image_id" ON "public"."images" USING "btree" ("parent_image_id");
 
 
 
@@ -4242,6 +5356,18 @@ CREATE INDEX "idx_images_status" ON "public"."images" USING "btree" ("status") W
 
 
 CREATE INDEX "idx_images_storage_location" ON "public"."images" USING "btree" ("storage_bucket", "storage_path");
+
+
+
+CREATE INDEX "idx_location_tags_country_code" ON "public"."location_tags" USING "btree" ("country_code");
+
+
+
+CREATE INDEX "idx_location_tags_kind" ON "public"."location_tags" USING "btree" ("kind");
+
+
+
+CREATE INDEX "idx_location_tags_name" ON "public"."location_tags" USING "btree" ("name");
 
 
 
@@ -4341,6 +5467,14 @@ CREATE INDEX "idx_submission_collaborators_user_id" ON "public"."submission_coll
 
 
 
+CREATE INDEX "idx_submission_draft_collaborator_invites_draft_id" ON "public"."submission_draft_collaborator_invites" USING "btree" ("draft_id");
+
+
+
+CREATE INDEX "idx_submission_draft_collaborators_user_id" ON "public"."submission_draft_collaborators" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "idx_submission_draft_images_draft_id" ON "public"."submission_draft_images" USING "btree" ("draft_id");
 
 
@@ -4389,6 +5523,10 @@ CREATE UNIQUE INDEX "uq_climbs_crag_id_slug" ON "public"."climbs" USING "btree" 
 
 
 
+CREATE UNIQUE INDEX "uq_crag_primary_region_tag" ON "public"."crag_location_tags" USING "btree" ("crag_id") WHERE "is_primary_region";
+
+
+
 CREATE UNIQUE INDEX "uq_crags_country_code_slug" ON "public"."crags" USING "btree" ("country_code", "slug") WHERE (("country_code" IS NOT NULL) AND ("slug" IS NOT NULL));
 
 
@@ -4398,6 +5536,10 @@ CREATE UNIQUE INDEX "uq_gym_floor_plans_one_active_per_gym" ON "public"."gym_flo
 
 
 CREATE UNIQUE INDEX "uq_gym_memberships_user_gym" ON "public"."gym_memberships" USING "btree" ("user_id", "gym_place_id");
+
+
+
+CREATE UNIQUE INDEX "uq_location_tags_kind_country_name" ON "public"."location_tags" USING "btree" ("kind", COALESCE("country_code", ''::character varying), "lower"(("name")::"text"));
 
 
 
@@ -4454,6 +5596,10 @@ CREATE OR REPLACE TRIGGER "trg_grade_votes_sync_climb_grade" AFTER INSERT OR DEL
 
 
 CREATE OR REPLACE TRIGGER "trg_submission_draft_images_updated_at" BEFORE UPDATE ON "public"."submission_draft_images" FOR EACH ROW EXECUTE FUNCTION "public"."touch_submission_draft_images_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_submission_draft_promoted_handoff" AFTER UPDATE OF "status" ON "public"."submission_drafts" FOR EACH ROW EXECUTE FUNCTION "public"."handle_submission_draft_promoted"();
 
 
 
@@ -4613,6 +5759,16 @@ ALTER TABLE ONLY "public"."crag_images"
 
 
 
+ALTER TABLE ONLY "public"."crag_location_tags"
+    ADD CONSTRAINT "crag_location_tags_crag_id_fkey" FOREIGN KEY ("crag_id") REFERENCES "public"."crags"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."crag_location_tags"
+    ADD CONSTRAINT "crag_location_tags_tag_id_fkey" FOREIGN KEY ("tag_id") REFERENCES "public"."location_tags"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."crag_reports"
     ADD CONSTRAINT "crag_reports_crag_id_fkey" FOREIGN KEY ("crag_id") REFERENCES "public"."crags"("id") ON DELETE CASCADE;
 
@@ -4689,6 +5845,11 @@ ALTER TABLE ONLY "public"."images"
 
 
 ALTER TABLE ONLY "public"."images"
+    ADD CONSTRAINT "images_parent_image_id_fkey" FOREIGN KEY ("parent_image_id") REFERENCES "public"."images"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."images"
     ADD CONSTRAINT "images_place_id_fkey" FOREIGN KEY ("place_id") REFERENCES "public"."places"("id") ON DELETE SET NULL;
 
 
@@ -4753,6 +5914,31 @@ ALTER TABLE ONLY "public"."submission_collaborators"
 
 
 
+ALTER TABLE ONLY "public"."submission_draft_collaborator_invites"
+    ADD CONSTRAINT "submission_draft_collaborator_invites_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."submission_draft_collaborator_invites"
+    ADD CONSTRAINT "submission_draft_collaborator_invites_draft_id_fkey" FOREIGN KEY ("draft_id") REFERENCES "public"."submission_drafts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."submission_draft_collaborators"
+    ADD CONSTRAINT "submission_draft_collaborators_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."submission_draft_collaborators"
+    ADD CONSTRAINT "submission_draft_collaborators_draft_id_fkey" FOREIGN KEY ("draft_id") REFERENCES "public"."submission_drafts"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."submission_draft_collaborators"
+    ADD CONSTRAINT "submission_draft_collaborators_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."submission_draft_images"
     ADD CONSTRAINT "submission_draft_images_draft_id_fkey" FOREIGN KEY ("draft_id") REFERENCES "public"."submission_drafts"("id") ON DELETE CASCADE;
 
@@ -4770,6 +5956,11 @@ ALTER TABLE ONLY "public"."submission_draft_images"
 
 ALTER TABLE ONLY "public"."submission_drafts"
     ADD CONSTRAINT "submission_drafts_crag_id_fkey" FOREIGN KEY ("crag_id") REFERENCES "public"."crags"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."submission_drafts"
+    ADD CONSTRAINT "submission_drafts_last_edited_by_fkey" FOREIGN KEY ("last_edited_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -4894,6 +6085,10 @@ CREATE POLICY "Authenticated create correction vote" ON "public"."correction_vot
 
 
 
+CREATE POLICY "Authenticated create crag location tags" ON "public"."crag_location_tags" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
+
+
+
 CREATE POLICY "Authenticated create crag report" ON "public"."crag_reports" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
 
 
@@ -4907,6 +6102,10 @@ CREATE POLICY "Authenticated create crags" ON "public"."crags" FOR INSERT WITH C
 
 
 CREATE POLICY "Authenticated create grade vote" ON "public"."grade_votes" FOR INSERT WITH CHECK ((("auth"."role"() = 'authenticated'::"text") AND ("auth"."uid"() = "user_id")));
+
+
+
+CREATE POLICY "Authenticated create location tags" ON "public"."location_tags" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
 
 
 
@@ -5002,6 +6201,12 @@ CREATE POLICY "Owner add collaborators" ON "public"."submission_collaborators" F
 
 
 
+CREATE POLICY "Owner add submission_draft_collaborators" ON "public"."submission_draft_collaborators" FOR INSERT WITH CHECK (((EXISTS ( SELECT 1
+   FROM "public"."submission_drafts" "d"
+  WHERE (("d"."id" = "submission_draft_collaborators"."draft_id") AND ("d"."user_id" = "auth"."uid"()) AND ("d"."status" = 'draft'::"text")))) AND ("created_by" = "auth"."uid"())));
+
+
+
 CREATE POLICY "Owner create climb_video_betas" ON "public"."climb_video_betas" FOR INSERT WITH CHECK (("auth"."uid"() = "user_id"));
 
 
@@ -5023,6 +6228,12 @@ CREATE POLICY "Owner create invites" ON "public"."submission_collaborator_invite
 CREATE POLICY "Owner create route_lines" ON "public"."route_lines" FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."climbs"
   WHERE (("climbs"."id" = "route_lines"."climb_id") AND ("climbs"."user_id" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "Owner create submission_draft_collaborator_invites" ON "public"."submission_draft_collaborator_invites" FOR INSERT WITH CHECK (((EXISTS ( SELECT 1
+   FROM "public"."submission_drafts" "d"
+  WHERE (("d"."id" = "submission_draft_collaborator_invites"."draft_id") AND ("d"."user_id" = "auth"."uid"()) AND ("d"."status" = 'draft'::"text")))) AND ("created_by" = "auth"."uid"())));
 
 
 
@@ -5052,6 +6263,22 @@ CREATE POLICY "Owner or collaborator read collaborators" ON "public"."submission
 
 
 
+CREATE POLICY "Owner or collaborator read submission_draft_collaborators" ON "public"."submission_draft_collaborators" FOR SELECT USING ((("user_id" = "auth"."uid"()) OR (EXISTS ( SELECT 1
+   FROM "public"."submission_drafts" "d"
+  WHERE (("d"."id" = "submission_draft_collaborators"."draft_id") AND ("d"."user_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "Owner or collaborator update draft submission_drafts" ON "public"."submission_drafts" FOR UPDATE USING ((("status" = 'draft'::"text") AND (("auth"."uid"() = "user_id") OR "public"."is_submission_draft_collaborator"("id", "auth"."uid"())))) WITH CHECK ((("status" = 'draft'::"text") AND (("auth"."uid"() = "user_id") OR "public"."is_submission_draft_collaborator"("id", "auth"."uid"()))));
+
+
+
+CREATE POLICY "Owner or self remove submission_draft_collaborators" ON "public"."submission_draft_collaborators" FOR DELETE USING ((("user_id" = "auth"."uid"()) OR (EXISTS ( SELECT 1
+   FROM "public"."submission_drafts" "d"
+  WHERE (("d"."id" = "submission_draft_collaborators"."draft_id") AND ("d"."user_id" = "auth"."uid"()))))));
+
+
+
 CREATE POLICY "Owner read invites" ON "public"."submission_collaborator_invites" FOR SELECT USING ((EXISTS ( SELECT 1
    FROM "public"."images" "i"
   WHERE (("i"."id" = "submission_collaborator_invites"."image_id") AND ("i"."created_by" = "auth"."uid"())))));
@@ -5066,6 +6293,12 @@ CREATE POLICY "Owner read own user_climbs" ON "public"."user_climbs" FOR SELECT 
 
 
 
+CREATE POLICY "Owner read submission_draft_collaborator_invites" ON "public"."submission_draft_collaborator_invites" FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "public"."submission_drafts" "d"
+  WHERE (("d"."id" = "submission_draft_collaborator_invites"."draft_id") AND ("d"."user_id" = "auth"."uid"())))));
+
+
+
 CREATE POLICY "Owner remove collaborators" ON "public"."submission_collaborators" FOR DELETE USING ((EXISTS ( SELECT 1
    FROM "public"."images" "i"
   WHERE (("i"."id" = "submission_collaborators"."image_id") AND ("i"."created_by" = "auth"."uid"())))));
@@ -5075,6 +6308,12 @@ CREATE POLICY "Owner remove collaborators" ON "public"."submission_collaborators
 CREATE POLICY "Owner revoke invites" ON "public"."submission_collaborator_invites" FOR DELETE USING ((EXISTS ( SELECT 1
    FROM "public"."images" "i"
   WHERE (("i"."id" = "submission_collaborator_invites"."image_id") AND ("i"."created_by" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "Owner revoke submission_draft_collaborator_invites" ON "public"."submission_draft_collaborator_invites" FOR DELETE USING ((EXISTS ( SELECT 1
+   FROM "public"."submission_drafts" "d"
+  WHERE (("d"."id" = "submission_draft_collaborator_invites"."draft_id") AND ("d"."user_id" = "auth"."uid"())))));
 
 
 
@@ -5142,6 +6381,10 @@ CREATE POLICY "Public read corrections" ON "public"."climb_corrections" FOR SELE
 
 
 
+CREATE POLICY "Public read crag location tags" ON "public"."crag_location_tags" FOR SELECT USING (true);
+
+
+
 CREATE POLICY "Public read crag reports" ON "public"."crag_reports" FOR SELECT USING (true);
 
 
@@ -5175,6 +6418,10 @@ CREATE POLICY "Public read gym_route_markers" ON "public"."gym_route_markers" FO
 
 
 CREATE POLICY "Public read gym_routes" ON "public"."gym_routes" FOR SELECT USING (true);
+
+
+
+CREATE POLICY "Public read location tags" ON "public"."location_tags" FOR SELECT USING (true);
 
 
 
@@ -5282,29 +6529,25 @@ CREATE POLICY "Users read own gym memberships" ON "public"."gym_memberships" FOR
 
 
 
+CREATE POLICY "Users read own or shared submission_draft_images" ON "public"."submission_draft_images" FOR SELECT USING ((EXISTS ( SELECT 1
+   FROM "public"."submission_drafts" "d"
+  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND (("d"."user_id" = "auth"."uid"()) OR "public"."is_submission_draft_collaborator"("d"."id", "auth"."uid"()))))));
+
+
+
+CREATE POLICY "Users read own or shared submission_drafts" ON "public"."submission_drafts" FOR SELECT USING ((("auth"."uid"() = "user_id") OR "public"."is_submission_draft_collaborator"("id", "auth"."uid"())));
+
+
+
 CREATE POLICY "Users read own place follows" ON "public"."community_place_follows" FOR SELECT USING (("auth"."uid"() = "user_id"));
 
 
 
-CREATE POLICY "Users read own submission_draft_images" ON "public"."submission_draft_images" FOR SELECT USING ((EXISTS ( SELECT 1
+CREATE POLICY "Users update own or shared submission_draft_images" ON "public"."submission_draft_images" FOR UPDATE USING ((EXISTS ( SELECT 1
    FROM "public"."submission_drafts" "d"
-  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND ("d"."user_id" = "auth"."uid"())))));
-
-
-
-CREATE POLICY "Users read own submission_drafts" ON "public"."submission_drafts" FOR SELECT USING (("auth"."uid"() = "user_id"));
-
-
-
-CREATE POLICY "Users update own submission_draft_images" ON "public"."submission_draft_images" FOR UPDATE USING ((EXISTS ( SELECT 1
+  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND ("d"."status" = 'draft'::"text") AND (("d"."user_id" = "auth"."uid"()) OR "public"."is_submission_draft_collaborator"("d"."id", "auth"."uid"())))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."submission_drafts" "d"
-  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND ("d"."user_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
-   FROM "public"."submission_drafts" "d"
-  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND ("d"."user_id" = "auth"."uid"())))));
-
-
-
-CREATE POLICY "Users update own submission_drafts" ON "public"."submission_drafts" FOR UPDATE USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND ("d"."status" = 'draft'::"text") AND (("d"."user_id" = "auth"."uid"()) OR "public"."is_submission_draft_collaborator"("d"."id", "auth"."uid"()))))));
 
 
 
@@ -5347,6 +6590,9 @@ ALTER TABLE "public"."correction_votes" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."crag_images" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."crag_location_tags" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."crag_reports" ENABLE ROW LEVEL SECURITY;
 
 
@@ -5386,6 +6632,9 @@ ALTER TABLE "public"."gym_routes" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."images" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."location_tags" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."notifications" ENABLE ROW LEVEL SECURITY;
 
 
@@ -5411,6 +6660,12 @@ ALTER TABLE "public"."submission_collaborator_invites" ENABLE ROW LEVEL SECURITY
 
 
 ALTER TABLE "public"."submission_collaborators" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."submission_draft_collaborator_invites" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."submission_draft_collaborators" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."submission_draft_images" ENABLE ROW LEVEL SECURITY;
@@ -5622,10 +6877,24 @@ GRANT ALL ON FUNCTION "public"."add_correction_type_value"("new_value" "text") T
 
 
 
+REVOKE ALL ON FUNCTION "public"."append_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."append_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) TO "anon";
+GRANT ALL ON FUNCTION "public"."append_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."append_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."claim_submission_draft_collaborator_invite"("p_token" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_submission_draft_collaborator_invite"("p_token" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."claim_submission_draft_collaborator_invite"("p_token" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."claim_submission_draft_collaborator_invite"("p_token" "uuid") TO "service_role";
 
 
 
@@ -5804,6 +7073,12 @@ GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."handle_submission_draft_promoted"() TO "anon";
+GRANT ALL ON FUNCTION "public"."handle_submission_draft_promoted"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."handle_submission_draft_promoted"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."handle_user_metadata_update"() TO "anon";
 GRANT ALL ON FUNCTION "public"."handle_user_metadata_update"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."handle_user_metadata_update"() TO "service_role";
@@ -5879,6 +7154,13 @@ GRANT ALL ON FUNCTION "public"."is_submission_collaborator"("p_image_id" "uuid",
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_submission_draft_collaborator"("p_draft_id" "uuid", "p_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_submission_draft_collaborator"("p_draft_id" "uuid", "p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_submission_draft_collaborator"("p_draft_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_submission_draft_collaborator"("p_draft_id" "uuid", "p_user_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."normalize_climb_route_type"("raw_type" "text") TO "service_role";
@@ -5889,6 +7171,20 @@ REVOKE ALL ON FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_
 GRANT ALL ON FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) TO "anon";
+GRANT ALL ON FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."patch_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."promote_draft_to_submission"("p_draft_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."promote_draft_to_submission"("p_draft_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."promote_draft_to_submission"("p_draft_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."promote_draft_to_submission"("p_draft_id" "uuid") TO "service_role";
 
 
 
@@ -6016,6 +7312,13 @@ GRANT ALL ON FUNCTION "public"."update_own_submitted_routes"("p_image_id" "uuid"
 
 
 
+REVOKE ALL ON FUNCTION "public"."update_submission_crag_metadata"("p_image_id" "uuid", "p_crag_name" "text", "p_region_tag" "text", "p_sub_area" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."update_submission_crag_metadata"("p_image_id" "uuid", "p_crag_name" "text", "p_region_tag" "text", "p_sub_area" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_submission_crag_metadata"("p_image_id" "uuid", "p_crag_name" "text", "p_region_tag" "text", "p_sub_area" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_submission_crag_metadata"("p_image_id" "uuid", "p_crag_name" "text", "p_region_tag" "text", "p_sub_area" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) TO "anon";
 GRANT ALL ON FUNCTION "public"."update_submission_image_metadata"("p_image_id" "uuid", "p_latitude" double precision, "p_longitude" double precision, "p_face_directions" "text"[]) TO "authenticated";
@@ -6122,6 +7425,12 @@ GRANT ALL ON TABLE "public"."correction_votes" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."crag_location_tags" TO "anon";
+GRANT ALL ON TABLE "public"."crag_location_tags" TO "authenticated";
+GRANT ALL ON TABLE "public"."crag_location_tags" TO "service_role";
+
+
+
 GRANT SELECT,MAINTAIN ON TABLE "public"."crag_reports" TO "anon";
 GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."crag_reports" TO "authenticated";
 GRANT ALL ON TABLE "public"."crag_reports" TO "service_role";
@@ -6199,6 +7508,12 @@ GRANT ALL ON TABLE "public"."images" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."location_tags" TO "anon";
+GRANT ALL ON TABLE "public"."location_tags" TO "authenticated";
+GRANT ALL ON TABLE "public"."location_tags" TO "service_role";
+
+
+
 GRANT SELECT,MAINTAIN ON TABLE "public"."notifications" TO "anon";
 GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."notifications" TO "authenticated";
 GRANT ALL ON TABLE "public"."notifications" TO "service_role";
@@ -6250,6 +7565,18 @@ GRANT ALL ON TABLE "public"."submission_collaborator_invites" TO "service_role";
 GRANT ALL ON TABLE "public"."submission_collaborators" TO "anon";
 GRANT ALL ON TABLE "public"."submission_collaborators" TO "authenticated";
 GRANT ALL ON TABLE "public"."submission_collaborators" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."submission_draft_collaborator_invites" TO "anon";
+GRANT ALL ON TABLE "public"."submission_draft_collaborator_invites" TO "authenticated";
+GRANT ALL ON TABLE "public"."submission_draft_collaborator_invites" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."submission_draft_collaborators" TO "anon";
+GRANT ALL ON TABLE "public"."submission_draft_collaborators" TO "authenticated";
+GRANT ALL ON TABLE "public"."submission_draft_collaborators" TO "service_role";
 
 
 
