@@ -1003,7 +1003,8 @@ primary_image AS (
     i.created_by,
     i.contribution_credit_platform,
     i.contribution_credit_handle,
-    i.face_directions
+    i.face_directions,
+    i.is_anonymous_submission
   FROM public.route_lines rl
   JOIN public.images i
     ON i.id = rl.image_id
@@ -2423,6 +2424,7 @@ DECLARE
   legacy_face_directions JSONB;
   face_directions_json JSONB;
   face_directions_text TEXT[];
+  anonymous_submission BOOLEAN := FALSE;
 BEGIN
   IF current_user_id IS NULL THEN
     RAISE EXCEPTION 'Authentication required';
@@ -2441,6 +2443,8 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Draft not found';
   END IF;
+
+  anonymous_submission := COALESCE((draft_row.metadata->>'isAnonymousSubmission')::BOOLEAN, FALSE);
 
   IF draft_row.user_id <> current_user_id THEN
     RAISE EXCEPTION 'Forbidden';
@@ -2552,7 +2556,8 @@ BEGIN
     face_directions,
     created_by,
     parent_image_id,
-    is_primary
+    is_primary,
+    is_anonymous_submission
   )
   VALUES (
     format('private://%s/%s', image_row.storage_bucket, image_row.storage_path),
@@ -2567,7 +2572,8 @@ BEGIN
     face_directions_text,
     current_user_id,
     NULL,
-    TRUE
+    TRUE,
+    anonymous_submission
   )
   RETURNING id INTO primary_live_image_id;
 
@@ -2613,7 +2619,8 @@ BEGIN
       face_directions,
       created_by,
       parent_image_id,
-      is_primary
+      is_primary,
+      is_anonymous_submission
     )
     VALUES (
       format('private://%s/%s', image_row.storage_bucket, image_row.storage_path),
@@ -2628,7 +2635,8 @@ BEGIN
       face_directions_text,
       current_user_id,
       primary_live_image_id,
-      FALSE
+      FALSE,
+      anonymous_submission
     )
     RETURNING id INTO current_live_image_id;
 
@@ -2767,27 +2775,24 @@ BEGIN
 
       all_climb_ids := array_append(all_climb_ids, created_climb_id);
       all_route_line_ids := array_append(all_route_line_ids, created_route_line_id);
-
       route_index := route_index + 1;
     END LOOP;
   END LOOP;
 
-  IF COALESCE(array_length(all_route_line_ids, 1), 0) = 0 THEN
-    RAISE EXCEPTION 'Draft must contain at least one valid route before publishing';
-  END IF;
-
   UPDATE public.submission_drafts
   SET
     status = 'submitted',
-    metadata = COALESCE(metadata, '{}'::JSONB) || jsonb_build_object(
-      'publishedImageId', primary_live_image_id,
-      'allPublishedImageIds', to_jsonb(all_live_image_ids),
-      'publishedClimbIds', to_jsonb(all_climb_ids),
-      'publishedRouteLineIds', to_jsonb(all_route_line_ids),
-      'publishedAt', NOW(),
-      'publishMode', 'v2-multiface'
-    ),
-    updated_at = NOW()
+    metadata = COALESCE(metadata, '{}'::JSONB)
+      || jsonb_build_object(
+        'publishedImageId', primary_live_image_id,
+        'allPublishedImageIds', to_jsonb(all_live_image_ids),
+        'publishedClimbIds', to_jsonb(all_climb_ids),
+        'publishedRouteLineIds', to_jsonb(all_route_line_ids),
+        'publishedAt', NOW(),
+        'isAnonymousSubmission', anonymous_submission
+      ),
+    updated_at = NOW(),
+    last_edited_by = current_user_id
   WHERE id = draft_row.id;
 
   RETURN jsonb_build_object(
@@ -3566,6 +3571,45 @@ $_$;
 
 
 ALTER FUNCTION "public"."update_own_profile_submission_credit"("p_platform" "text", "p_handle" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."update_own_submission_anonymity"("p_image_id" "uuid", "p_is_anonymous" boolean) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  current_user_id UUID := auth.uid();
+  next_is_anonymous BOOLEAN := COALESCE(p_is_anonymous, FALSE);
+BEGIN
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  IF p_image_id IS NULL THEN
+    RAISE EXCEPTION 'Image ID is required';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.images i
+    WHERE i.id = p_image_id
+      AND i.created_by = current_user_id
+  ) THEN
+    RAISE EXCEPTION 'You do not have permission to edit this submission';
+  END IF;
+
+  UPDATE public.images
+  SET is_anonymous_submission = next_is_anonymous
+  WHERE id = p_image_id;
+
+  RETURN jsonb_build_object(
+    'isAnonymousSubmission', next_is_anonymous
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_own_submission_anonymity"("p_image_id" "uuid", "p_is_anonymous" boolean) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_own_submission_credit"("p_image_id" "uuid", "p_platform" "text", "p_handle" "text") RETURNS "jsonb"
@@ -4482,6 +4526,7 @@ CREATE TABLE IF NOT EXISTS "public"."images" (
     "last_edited_by" "uuid",
     "parent_image_id" "uuid",
     "is_primary" boolean DEFAULT true NOT NULL,
+    "is_anonymous_submission" boolean DEFAULT false NOT NULL,
     CONSTRAINT "images_face_direction_check" CHECK ((("face_direction" IS NULL) OR (("face_direction")::"text" = ANY ((ARRAY['N'::character varying, 'NE'::character varying, 'E'::character varying, 'SE'::character varying, 'S'::character varying, 'SW'::character varying, 'W'::character varying, 'NW'::character varying])::"text"[])))),
     CONSTRAINT "images_face_directions_check" CHECK ((("face_directions" IS NULL) OR ("face_directions" <@ ARRAY['N'::"text", 'NE'::"text", 'E'::"text", 'SE'::"text", 'S'::"text", 'SW'::"text", 'W'::"text", 'NW'::"text"]))),
     CONSTRAINT "images_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying, 'deleted'::character varying])::"text"[])))
@@ -5328,6 +5373,10 @@ CREATE INDEX "idx_images_created_at" ON "public"."images" USING "btree" ("create
 
 
 CREATE INDEX "idx_images_created_by" ON "public"."images" USING "btree" ("created_by");
+
+
+
+CREATE INDEX "idx_images_is_anonymous_submission" ON "public"."images" USING "btree" ("is_anonymous_submission");
 
 
 
@@ -6269,7 +6318,7 @@ CREATE POLICY "Owner or collaborator read submission_draft_collaborators" ON "pu
 
 
 
-CREATE POLICY "Owner or collaborator update draft submission_drafts" ON "public"."submission_drafts" FOR UPDATE USING ((("status" = 'draft'::"text") AND (("auth"."uid"() = "user_id") OR "public"."is_submission_draft_collaborator"("id", "auth"."uid"())))) WITH CHECK ((("status" = 'draft'::"text") AND (("auth"."uid"() = "user_id") OR "public"."is_submission_draft_collaborator"("id", "auth"."uid"()))));
+CREATE POLICY "Owner or collaborator update draft submission_drafts" ON "public"."submission_drafts" FOR UPDATE USING ((("status" = 'draft'::"text") AND (("auth"."uid"() = "user_id") OR "public"."is_submission_draft_collaborator"("id", "auth"."uid"())))) WITH CHECK (((("auth"."uid"() = "user_id") AND ("status" = ANY (ARRAY['draft'::"text", 'submitted'::"text"]))) OR ("public"."is_submission_draft_collaborator"("id", "auth"."uid"()) AND ("status" = 'draft'::"text"))));
 
 
 
@@ -6493,9 +6542,9 @@ CREATE POLICY "Users can view their own deletion requests" ON "public"."deletion
 
 
 
-CREATE POLICY "Users create own submission_draft_images" ON "public"."submission_draft_images" FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
+CREATE POLICY "Users create own or shared submission_draft_images" ON "public"."submission_draft_images" FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."submission_drafts" "d"
-  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND ("d"."user_id" = "auth"."uid"())))));
+  WHERE (("d"."id" = "submission_draft_images"."draft_id") AND ("d"."status" = 'draft'::"text") AND (("d"."user_id" = "auth"."uid"()) OR "public"."is_submission_draft_collaborator"("d"."id", "auth"."uid"()))))));
 
 
 
@@ -7295,6 +7344,13 @@ REVOKE ALL ON FUNCTION "public"."update_own_profile_submission_credit"("p_platfo
 GRANT ALL ON FUNCTION "public"."update_own_profile_submission_credit"("p_platform" "text", "p_handle" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."update_own_profile_submission_credit"("p_platform" "text", "p_handle" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_own_profile_submission_credit"("p_platform" "text", "p_handle" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."update_own_submission_anonymity"("p_image_id" "uuid", "p_is_anonymous" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."update_own_submission_anonymity"("p_image_id" "uuid", "p_is_anonymous" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."update_own_submission_anonymity"("p_image_id" "uuid", "p_is_anonymous" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_own_submission_anonymity"("p_image_id" "uuid", "p_is_anonymous" boolean) TO "service_role";
 
 
 
