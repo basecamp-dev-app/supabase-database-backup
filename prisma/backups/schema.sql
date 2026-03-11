@@ -20,6 +20,12 @@ CREATE EXTENSION IF NOT EXISTS "pg_cron" WITH SCHEMA "pg_catalog";
 
 
 
+CREATE SCHEMA IF NOT EXISTS "internal";
+
+
+ALTER SCHEMA "internal" OWNER TO "postgres";
+
+
 COMMENT ON SCHEMA "public" IS 'standard public schema';
 
 
@@ -216,6 +222,67 @@ $$;
 
 
 ALTER FUNCTION "public"."append_submission_draft_images_atomic"("p_draft_id" "uuid", "p_images" "jsonb", "p_expected_updated_at" timestamp with time zone) OWNER TO "postgres";
+
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."media_jobs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "image_id" "uuid" NOT NULL,
+    "job_type" "text" NOT NULL,
+    "status" "text" DEFAULT 'queued'::"text" NOT NULL,
+    "payload" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "attempts" integer DEFAULT 0 NOT NULL,
+    "max_attempts" integer DEFAULT 5 NOT NULL,
+    "run_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "locked_at" timestamp with time zone,
+    "locked_by" "text",
+    "last_error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "media_jobs_attempts_check" CHECK (("attempts" >= 0)),
+    CONSTRAINT "media_jobs_job_type_check" CHECK (("job_type" = 'ingest_image'::"text")),
+    CONSTRAINT "media_jobs_max_attempts_check" CHECK (("max_attempts" >= 1)),
+    CONSTRAINT "media_jobs_status_check" CHECK (("status" = ANY (ARRAY['queued'::"text", 'processing'::"text", 'completed'::"text", 'failed'::"text", 'cancelled'::"text"])))
+);
+
+
+ALTER TABLE "public"."media_jobs" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_media_job"("worker_name" "text") RETURNS "public"."media_jobs"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  claimed_job public.media_jobs;
+BEGIN
+  UPDATE public.media_jobs mj
+  SET
+    status = 'processing',
+    locked_at = NOW(),
+    locked_by = worker_name,
+    attempts = mj.attempts + 1,
+    updated_at = NOW()
+  WHERE mj.id = (
+    SELECT id
+    FROM public.media_jobs
+    WHERE status = 'queued'
+      AND run_at <= NOW()
+    ORDER BY run_at ASC, created_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+  )
+  RETURNING mj.* INTO claimed_job;
+
+  RETURN claimed_job;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_media_job"("worker_name" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") RETURNS "jsonb"
@@ -951,10 +1018,12 @@ ALTER FUNCTION "public"."find_region_by_location"("search_lat" double precision,
 
 CREATE OR REPLACE FUNCTION "public"."get_active_climbers_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'auth', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
-  SELECT COUNT(DISTINCT user_id) FROM logs
-  WHERE date_climbed >= NOW() - INTERVAL '60 days';
+  SELECT COUNT(DISTINCT user_id)
+  FROM public.user_climbs
+  WHERE created_at >= NOW() - INTERVAL '60 days'
+    AND style IN ('top', 'flash', 'onsight');
 $$;
 
 
@@ -1106,7 +1175,7 @@ faces_agg AS (
         'index', ROW_NUMBER() OVER (ORDER BY rf.created_at ASC),
         'image_id', rf.linked_image_id,
         'is_primary', FALSE,
-        'url', rf.url,
+        'url', COALESCE(li.url, rf.url),
         'linked_image_id', CASE WHEN rf.linked_image_id = pi.id THEN NULL ELSE rf.linked_image_id END,
         'crag_image_id', rf.crag_image_id,
         'face_directions', rf.face_directions,
@@ -1191,6 +1260,28 @@ $$;
 
 
 ALTER FUNCTION "public"."get_climbs_with_consensus"("p_climb_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_community_contributors_count"() RETURNS bigint
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT COUNT(*)
+  FROM (
+    SELECT user_id AS contributor_id
+    FROM public.climbs
+    WHERE user_id IS NOT NULL
+
+    UNION
+
+    SELECT created_by AS contributor_id
+    FROM public.images
+    WHERE created_by IS NOT NULL
+  ) AS contributors;
+$$;
+
+
+ALTER FUNCTION "public"."get_community_contributors_count"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_community_photos_count"() RETURNS bigint
@@ -1331,7 +1422,7 @@ supplementary_faces AS (
     'image_id', rf.linked_image_id,
     'index', ROW_NUMBER() OVER (ORDER BY rf.created_at ASC),
     'is_primary', false,
-    'url', rf.url,
+    'url', COALESCE(li.url, rf.url),
     'linked_image_id', CASE WHEN rf.linked_image_id = p_image_id THEN NULL ELSE rf.linked_image_id END,
     'crag_image_id', rf.crag_image_id,
     'face_directions', rf.face_directions,
@@ -1435,6 +1526,18 @@ $$;
 ALTER FUNCTION "public"."get_crag_pins"("include_pending" boolean) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_crags_mapped_count"() RETURNS bigint
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT COUNT(*)
+  FROM public.get_crag_pins(FALSE);
+$$;
+
+
+ALTER FUNCTION "public"."get_crags_mapped_count"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."get_grade_vote_distribution"("climb_id" "uuid") RETURNS TABLE("grade" character varying, "vote_count" integer)
     LANGUAGE "plpgsql" STABLE
     SET "search_path" TO 'public'
@@ -1532,10 +1635,11 @@ ALTER FUNCTION "public"."get_total_logs_count"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_total_sends_count"() RETURNS bigint
     LANGUAGE "sql" SECURITY DEFINER
-    SET "search_path" TO 'public', 'auth', 'extensions'
+    SET "search_path" TO 'public'
     AS $$
-  SELECT COUNT(*) FROM logs
-  WHERE status IN ('completed', 'flash', 'onsight');
+  SELECT COUNT(*)
+  FROM public.user_climbs
+  WHERE style IN ('top', 'flash', 'onsight');
 $$;
 
 
@@ -1921,10 +2025,6 @@ $$;
 
 
 ALTER FUNCTION "public"."insert_grade_vote"("p_climb_id" "uuid", "vote_grade" character varying) OWNER TO "postgres";
-
-SET default_tablespace = '';
-
-SET default_table_access_method = "heap";
 
 
 CREATE TABLE IF NOT EXISTS "public"."crag_images" (
@@ -2535,12 +2635,13 @@ BEGIN
     face_directions_json := legacy_face_directions;
   END IF;
 
-  IF jsonb_typeof(face_directions_json) <> 'array' OR jsonb_array_length(face_directions_json) = 0 THEN
-    RAISE EXCEPTION 'Primary face directions are required before publishing';
-  END IF;
-
   face_directions_text := ARRAY(
-    SELECT jsonb_array_elements_text(face_directions_json)
+    SELECT jsonb_array_elements_text(
+      CASE
+        WHEN jsonb_typeof(face_directions_json) = 'array' THEN face_directions_json
+        ELSE '[]'::JSONB
+      END
+    )
   );
 
   INSERT INTO public.images (
@@ -3305,6 +3406,19 @@ $$;
 ALTER FUNCTION "public"."sync_profile_on_login"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."touch_media_jobs_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  NEW.updated_at := NOW();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."touch_media_jobs_updated_at"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."touch_submission_draft_images_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO 'public', 'auth', 'extensions'
@@ -4056,6 +4170,21 @@ $$;
 ALTER FUNCTION "public"."validate_comment_target"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE VIEW "internal"."worker_health" WITH ("security_invoker"='true') AS
+ SELECT "count"(*) FILTER (WHERE ("status" = 'queued'::"text")) AS "backlog_count",
+    "count"(*) FILTER (WHERE ("status" = 'processing'::"text")) AS "active_jobs",
+    "count"(*) FILTER (WHERE ("status" = 'completed'::"text")) AS "completed_jobs",
+    "count"(*) FILTER (WHERE ("status" = 'failed'::"text")) AS "failed_jobs",
+    "max"(("now"() - "created_at")) FILTER (WHERE ("status" = 'queued'::"text")) AS "oldest_queued_job_age",
+    "max"(("now"() - "updated_at")) FILTER (WHERE ("status" = 'processing'::"text")) AS "oldest_active_job_age",
+    "max"("created_at") AS "latest_job_created_at",
+    "max"("updated_at") AS "latest_job_updated_at"
+   FROM "public"."media_jobs";
+
+
+ALTER VIEW "internal"."worker_health" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."admin_actions" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -4527,9 +4656,28 @@ CREATE TABLE IF NOT EXISTS "public"."images" (
     "parent_image_id" "uuid",
     "is_primary" boolean DEFAULT true NOT NULL,
     "is_anonymous_submission" boolean DEFAULT false NOT NULL,
+    "storage_provider" "text" DEFAULT 'supabase'::"text" NOT NULL,
+    "original_bucket" "text",
+    "original_key" "text",
+    "original_mime_type" "text",
+    "original_bytes" bigint,
+    "original_width" integer,
+    "original_height" integer,
+    "asset_version" integer DEFAULT 1 NOT NULL,
+    "variants" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "visibility" "text" DEFAULT 'private'::"text" NOT NULL,
+    "processing_status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "checksum_sha256" "text",
+    "processed_at" timestamp with time zone,
+    "moderation_provider" "text",
+    "moderation_error" "text",
+    CONSTRAINT "images_asset_version_check" CHECK (("asset_version" >= 1)),
     CONSTRAINT "images_face_direction_check" CHECK ((("face_direction" IS NULL) OR (("face_direction")::"text" = ANY ((ARRAY['N'::character varying, 'NE'::character varying, 'E'::character varying, 'SE'::character varying, 'S'::character varying, 'SW'::character varying, 'W'::character varying, 'NW'::character varying])::"text"[])))),
     CONSTRAINT "images_face_directions_check" CHECK ((("face_directions" IS NULL) OR ("face_directions" <@ ARRAY['N'::"text", 'NE'::"text", 'E'::"text", 'SE'::"text", 'S'::"text", 'SW'::"text", 'W'::"text", 'NW'::"text"]))),
-    CONSTRAINT "images_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying, 'deleted'::character varying])::"text"[])))
+    CONSTRAINT "images_processing_status_check" CHECK (("processing_status" = ANY (ARRAY['pending'::"text", 'queued'::"text", 'processing'::"text", 'ready'::"text", 'failed'::"text"]))),
+    CONSTRAINT "images_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'approved'::character varying, 'rejected'::character varying, 'deleted'::character varying])::"text"[]))),
+    CONSTRAINT "images_storage_provider_check" CHECK (("storage_provider" = ANY (ARRAY['supabase'::"text", 'r2'::"text"]))),
+    CONSTRAINT "images_visibility_check" CHECK (("visibility" = ANY (ARRAY['private'::"text", 'public'::"text"])))
 );
 
 
@@ -4776,9 +4924,20 @@ CREATE TABLE IF NOT EXISTS "public"."submission_draft_images" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "submitted_at" timestamp with time zone,
+    "storage_provider" "text" DEFAULT 'supabase'::"text" NOT NULL,
+    "original_bucket" "text",
+    "original_key" "text",
+    "original_mime_type" "text",
+    "original_bytes" bigint,
+    "preview_variants" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "processing_status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "checksum_sha256" "text",
+    "processed_at" timestamp with time zone,
     CONSTRAINT "submission_draft_images_display_order_check" CHECK (("display_order" >= 0)),
+    CONSTRAINT "submission_draft_images_processing_status_check" CHECK (("processing_status" = ANY (ARRAY['pending'::"text", 'queued'::"text", 'processing'::"text", 'ready'::"text", 'failed'::"text"]))),
     CONSTRAINT "submission_draft_images_storage_bucket_check" CHECK (("char_length"(TRIM(BOTH FROM "storage_bucket")) > 0)),
-    CONSTRAINT "submission_draft_images_storage_path_check" CHECK (("char_length"(TRIM(BOTH FROM "storage_path")) > 0))
+    CONSTRAINT "submission_draft_images_storage_path_check" CHECK (("char_length"(TRIM(BOTH FROM "storage_path")) > 0)),
+    CONSTRAINT "submission_draft_images_storage_provider_check" CHECK (("storage_provider" = ANY (ARRAY['supabase'::"text", 'r2'::"text"])))
 );
 
 
@@ -4818,6 +4977,16 @@ CREATE TABLE IF NOT EXISTS "public"."user_climbs" (
 
 
 ALTER TABLE "public"."user_climbs" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."worker_health" AS
+ SELECT "count"(*) FILTER (WHERE ("status" = 'pending'::"text")) AS "backlog_count",
+    "count"(*) FILTER (WHERE ("status" = 'processing'::"text")) AS "active_jobs",
+    "max"(("now"() - "created_at")) AS "oldest_job_age"
+   FROM "public"."media_jobs";
+
+
+ALTER VIEW "public"."worker_health" OWNER TO "postgres";
 
 
 ALTER TABLE ONLY "public"."admin_actions"
@@ -4982,6 +5151,11 @@ ALTER TABLE ONLY "public"."images"
 
 ALTER TABLE ONLY "public"."location_tags"
     ADD CONSTRAINT "location_tags_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."media_jobs"
+    ADD CONSTRAINT "media_jobs_pkey" PRIMARY KEY ("id");
 
 
 
@@ -5392,11 +5566,19 @@ CREATE INDEX "idx_images_moderation_status" ON "public"."images" USING "btree" (
 
 
 
+CREATE INDEX "idx_images_original_location" ON "public"."images" USING "btree" ("original_bucket", "original_key");
+
+
+
 CREATE INDEX "idx_images_parent_image_id" ON "public"."images" USING "btree" ("parent_image_id");
 
 
 
 CREATE INDEX "idx_images_place" ON "public"."images" USING "btree" ("place_id");
+
+
+
+CREATE INDEX "idx_images_processing_status" ON "public"."images" USING "btree" ("processing_status", "visibility");
 
 
 
@@ -5417,6 +5599,14 @@ CREATE INDEX "idx_location_tags_kind" ON "public"."location_tags" USING "btree" 
 
 
 CREATE INDEX "idx_location_tags_name" ON "public"."location_tags" USING "btree" ("name");
+
+
+
+CREATE INDEX "idx_media_jobs_image_id" ON "public"."media_jobs" USING "btree" ("image_id", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_media_jobs_status_run_at" ON "public"."media_jobs" USING "btree" ("status", "run_at");
 
 
 
@@ -5525,6 +5715,10 @@ CREATE INDEX "idx_submission_draft_collaborators_user_id" ON "public"."submissio
 
 
 CREATE INDEX "idx_submission_draft_images_draft_id" ON "public"."submission_draft_images" USING "btree" ("draft_id");
+
+
+
+CREATE INDEX "idx_submission_draft_images_original_location" ON "public"."submission_draft_images" USING "btree" ("original_bucket", "original_key");
 
 
 
@@ -5641,6 +5835,10 @@ CREATE OR REPLACE TRIGGER "route_lines_set_climb_gps" AFTER INSERT OR UPDATE OF 
 
 
 CREATE OR REPLACE TRIGGER "trg_grade_votes_sync_climb_grade" AFTER INSERT OR DELETE OR UPDATE OF "grade" ON "public"."grade_votes" FOR EACH ROW EXECUTE FUNCTION "public"."grade_votes_sync_climb_grade_trigger"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_media_jobs_updated_at" BEFORE UPDATE ON "public"."media_jobs" FOR EACH ROW EXECUTE FUNCTION "public"."touch_media_jobs_updated_at"();
 
 
 
@@ -5900,6 +6098,11 @@ ALTER TABLE ONLY "public"."images"
 
 ALTER TABLE ONLY "public"."images"
     ADD CONSTRAINT "images_place_id_fkey" FOREIGN KEY ("place_id") REFERENCES "public"."places"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."media_jobs"
+    ADD CONSTRAINT "media_jobs_image_id_fkey" FOREIGN KEY ("image_id") REFERENCES "public"."images"("id") ON DELETE CASCADE;
 
 
 
@@ -6520,6 +6723,10 @@ CREATE POLICY "Service role manage deletion requests" ON "public"."deletion_requ
 
 
 
+CREATE POLICY "Service role manage media_jobs" ON "public"."media_jobs" USING (("auth"."role"() = 'service_role'::"text")) WITH CHECK (("auth"."role"() = 'service_role'::"text"));
+
+
+
 CREATE POLICY "User read own notifications" ON "public"."notifications" FOR SELECT USING ((("auth"."uid"() = "user_id") OR (EXISTS ( SELECT 1
    FROM "public"."profiles"
   WHERE (("profiles"."id" = "auth"."uid"()) AND ("profiles"."is_admin" = true))))));
@@ -6684,6 +6891,9 @@ ALTER TABLE "public"."images" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."location_tags" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."media_jobs" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."notifications" ENABLE ROW LEVEL SECURITY;
 
 
@@ -6739,6 +6949,10 @@ ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."notifications";
 
 
 
+
+
+
+GRANT USAGE ON SCHEMA "internal" TO "service_role";
 
 
 
@@ -6933,6 +7147,19 @@ GRANT ALL ON FUNCTION "public"."append_submission_draft_images_atomic"("p_draft_
 
 
 
+GRANT ALL ON TABLE "public"."media_jobs" TO "anon";
+GRANT ALL ON TABLE "public"."media_jobs" TO "authenticated";
+GRANT ALL ON TABLE "public"."media_jobs" TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."claim_media_job"("worker_name" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_media_job"("worker_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."claim_media_job"("worker_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."claim_media_job"("worker_name" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."claim_submission_collaborator_invite"("p_token" "uuid") TO "authenticated";
@@ -7023,6 +7250,12 @@ GRANT ALL ON FUNCTION "public"."get_climbs_with_consensus"("p_climb_ids" "uuid"[
 
 
 
+GRANT ALL ON FUNCTION "public"."get_community_contributors_count"() TO "anon";
+GRANT ALL ON FUNCTION "public"."get_community_contributors_count"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_community_contributors_count"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."get_community_photos_count"() TO "anon";
 GRANT ALL ON FUNCTION "public"."get_community_photos_count"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_community_photos_count"() TO "service_role";
@@ -7051,6 +7284,12 @@ GRANT ALL ON FUNCTION "public"."get_crag_pins"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."get_crag_pins"("include_pending" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."get_crag_pins"("include_pending" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_crag_pins"("include_pending" boolean) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_crags_mapped_count"() TO "anon";
+GRANT ALL ON FUNCTION "public"."get_crags_mapped_count"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_crags_mapped_count"() TO "service_role";
 
 
 
@@ -7304,6 +7543,12 @@ GRANT ALL ON FUNCTION "public"."sync_profile_on_login"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."touch_media_jobs_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."touch_media_jobs_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."touch_media_jobs_updated_at"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."touch_submission_draft_images_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."touch_submission_draft_images_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."touch_submission_draft_images_updated_at"() TO "service_role";
@@ -7406,6 +7651,10 @@ GRANT ALL ON FUNCTION "public"."validate_comment_target"() TO "service_role";
 
 
 
+
+
+
+GRANT SELECT ON TABLE "internal"."worker_health" TO "service_role";
 
 
 
@@ -7651,6 +7900,12 @@ GRANT ALL ON TABLE "public"."submission_drafts" TO "service_role";
 GRANT SELECT,MAINTAIN ON TABLE "public"."user_climbs" TO "anon";
 GRANT SELECT,INSERT,DELETE,MAINTAIN,UPDATE ON TABLE "public"."user_climbs" TO "authenticated";
 GRANT ALL ON TABLE "public"."user_climbs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."worker_health" TO "anon";
+GRANT ALL ON TABLE "public"."worker_health" TO "authenticated";
+GRANT ALL ON TABLE "public"."worker_health" TO "service_role";
 
 
 
