@@ -155,6 +155,9 @@ BEGIN
       (item->>'storage_path')::TEXT AS storage_path,
       COALESCE((item->>'width')::INTEGER, NULL) AS width,
       COALESCE((item->>'height')::INTEGER, NULL) AS height,
+      NULLIF(item->'gps_data'->>'latitude', '')::NUMERIC AS latitude,
+      NULLIF(item->'gps_data'->>'longitude', '')::NUMERIC AS longitude,
+      NULLIF(item->>'capture_date', '')::TIMESTAMPTZ AS capture_date,
       COALESCE(item->'route_data', '{}'::JSONB) AS route_data,
       ordinality - 1 AS offset_index
     FROM jsonb_array_elements(p_images) WITH ORDINALITY AS item(item, ordinality)
@@ -167,6 +170,9 @@ BEGIN
       storage_path,
       width,
       height,
+      latitude,
+      longitude,
+      capture_date,
       route_data
     )
     SELECT
@@ -176,6 +182,9 @@ BEGIN
       payload.storage_path,
       payload.width,
       payload.height,
+      payload.latitude,
+      payload.longitude,
+      payload.capture_date,
       payload.route_data
     FROM payload
     RETURNING id
@@ -209,6 +218,9 @@ BEGIN
           'storage_path', storage_path,
           'width', width,
           'height', height,
+          'latitude', latitude,
+          'longitude', longitude,
+          'capture_date', capture_date,
           'updated_at', updated_at
         )
         ORDER BY display_order
@@ -2855,6 +2867,9 @@ BEGIN
     storage_bucket,
     storage_path,
     crag_id,
+    latitude,
+    longitude,
+    capture_date,
     width,
     height,
     natural_width,
@@ -2875,6 +2890,9 @@ BEGIN
     image_row.storage_bucket,
     image_row.storage_path,
     draft_row.crag_id,
+    image_row.latitude,
+    image_row.longitude,
+    image_row.capture_date,
     image_row.width,
     image_row.height,
     image_row.width,
@@ -2926,6 +2944,9 @@ BEGIN
       storage_bucket,
       storage_path,
       crag_id,
+      latitude,
+      longitude,
+      capture_date,
       width,
       height,
       natural_width,
@@ -2946,6 +2967,9 @@ BEGIN
       image_row.storage_bucket,
       image_row.storage_path,
       draft_row.crag_id,
+      image_row.latitude,
+      image_row.longitude,
+      image_row.capture_date,
       image_row.width,
       image_row.height,
       image_row.width,
@@ -5174,6 +5198,9 @@ CREATE TABLE IF NOT EXISTS "public"."submission_draft_images" (
     "processing_status" "text" DEFAULT 'pending'::"text" NOT NULL,
     "checksum_sha256" "text",
     "processed_at" timestamp with time zone,
+    "latitude" numeric,
+    "longitude" numeric,
+    "capture_date" timestamp with time zone,
     CONSTRAINT "submission_draft_images_display_order_check" CHECK (("display_order" >= 0)),
     CONSTRAINT "submission_draft_images_processing_status_check" CHECK (("processing_status" = ANY (ARRAY['pending'::"text", 'queued'::"text", 'processing'::"text", 'ready'::"text", 'failed'::"text"]))),
     CONSTRAINT "submission_draft_images_storage_bucket_check" CHECK (("char_length"(TRIM(BOTH FROM "storage_bucket")) > 0)),
